@@ -127,18 +127,47 @@ dynamic slicing, no graph breaks. Every conditional branch becomes its own NEFF.
 After warmup `fail_on_recompile` is armed, so an uncovered shape is a **hard
 failure**, not a slow path.
 
-### 3.2 `head_dim` is capped at 128
+### 3.2 `head_dim` is capped at 128 — **in prefill only**
 
 `MAX_HEAD_DIM = 128` in `vllm_neuron/functional/attention/attention_cte.py` and
 `_MAX_HEAD_DIM = 128` in `attention_segmented_cte.py`. This is `P_MAX`, the SBUF
 partition dimension — a hardware property, not a software limit.
+
+**Both of those files are `*_cte` — context encoding, i.e. prefill. The cap does
+not apply to decode.** Established by dev3 from `nkilib` source and verified
+independently here on 2026-09-25:
+
+- `MAX_HEAD_DIM` appears **nowhere** outside those two prefill files.
+- `attention_decode.py` has no head-dim ceiling at all. Its eligibility guard
+  `_can_use_attention_block_kernel` (line 1211) rejects only an **odd** `d_head`
+  (line 1255, `if d_head % 2 != 0`).
+- `nkilib/core/attention/attention_tkg.py:52` sets `_MAX_D_HEAD = 512`, asserted
+  at line 1222 as `0 < cfg.d_head <= _MAX_D_HEAD`. TKG is token generation, i.e.
+  decode.
+
+So a model with `head_dim` in (128, 512] loses the fused kernel on **prefill**
+and keeps it on **decode**. That is a much narrower problem than "falls off the
+fused attention path entirely", which is what this section used to say.
 
 Models above it fall off the fused attention path entirely. PR #40 (MiMo-V2.5,
 192-wide Q/K) had to run **eager attention with fp32 scores**. The NxDI Qwen3.5
 port worked around it by hot-swapping `sys.modules` to a forked `nkilib` with
 `_MAX_HEAD_DIM=256`.
 
-**Affects us directly:** Qwen3.8-27B is `head_dim: 256`; MiMo-V2.6-Pro is 192.
+**Not a concern for Qwen3.8-27B** (`head_dim: 256`), verified 2026-09-25 against
+PR #54 as merged. Its full-attention layers never enter the fused path at all:
+there is no `NF.`/`flash_attention`/`segmented_attention` call anywhere in
+`model/qwen3_5/model.py` — the sole mention of `NF.flash_attention` is inside a
+docstring. Both `forward_prefill` and `forward_decode` compute attention inline
+in fp32 (`q.float() @ k.float().transpose(-1, -2)` then `torch.softmax`), so
+`MAX_HEAD_DIM` is never reached and there is nothing to work around. The
+`sys.modules` hot-swap should **not** be attempted here. PR #54 measures the cost
+of the eager path at 6–8% of prefill, i.e. a **performance** item, not a
+correctness gate.
+
+Still relevant to **MiMo-V2.6-Pro** (192), which has no such port yet — but per
+the above, only on its prefill path. Its decode would keep the fused kernel,
+since 192 is well inside `_MAX_D_HEAD = 512`.
 
 ### 3.3 No recurrent-state cache (as of this fork point)
 
@@ -190,31 +219,72 @@ From PR #40's write-up, all real and none of it model math:
 
 ## 4. Kernels: less work than assumed
 
-`nkilib` is `pip install nki-library`, Apache-2.0, full source at
+`nkilib` is Apache-2.0, full source at
 [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library). It ships
-bundled inside `neuronx-cc` and the pip package replaces it.
+bundled inside `neuronx-cc`. **There is no separate AWS `nki-library` pip
+package**, and the way it is missing is a trap rather than an error (checked
+2026-09-25):
 
-Most "missing ops" for our target models **already exist** in
-`nkilib/experimental/`:
+- On the Neuron index, `https://pip.repos.neuron.amazonaws.com/nki-library/`
+  returns **404**.
+- On **PyPI**, `nki-library` **exists** — version 0.0.2, no summary, no author,
+  no homepage, two files, releases 0.0.1 and 0.0.2. That is a placeholder, not
+  AWS's library.
 
-| Directory | Contents | Relevant to |
-|---|---|---|
-| `gdn/` | `gdn_tkg.py`, **`gdn_cte.py`**, `gdn_conv1d.py`, `gdn_block_tkg.py`, + `_torch` refs | Qwen3.8-27B; base for GLM-5.3-Flash KDA |
-| `mla/deepseek/` | `mla_qkv_cte`, `mla_sparse_attention_cte`, `mla_vup_oproj_cte` — **prefill only** | GLM-5.3, DeepSeek-V4.1 |
-| `sparse_attention_indexer/` | DeepSeek sparse-attention indexer, top-k | GLM-5.3 DSA |
-| `deepseekv32_mlp/`, `moe_block/`, `moe_mxfp8/` | MoE + EP + MXFP8 | all MoE targets |
-| `scan/` | linear scan, selective scan (Mamba), SSD (Mamba-2) | linear-attention fallbacks |
-| `attention/`, `attention_mxfp8/`, `transformer/` | flash CTE/TKG, SWA fused, megakernels | everything |
+So `pip install nki-library` — which an earlier draft of this section
+recommended — **succeeds and installs a stub**. It does not fail loudly. Whatever
+`neuronx-cc` bundles is what you actually get.
 
-Note `gdn_cte.py` — the chunked DeltaNet **prefill** kernel. Earlier NxDI work
-assumed this had to be written; it did not.
+> **Correction, 2026-09-25.** The table below was built from a *source checkout*
+> of nki-library. It does **not** describe the installed package. Verified
+> against the `nkilib` bundled with `neuronx-cc 2.27.5334.0` — version
+> `0.0.0.0dev0+3b542be2`, built Jul 15 2026 — on the dev box:
+>
+> `experimental/` contains: `attention`, `attention_mxfp8`, `benchmark`,
+> `collectives`, `conv`, `deformable_attention`, `dynamic_shapes`, `foreach`,
+> `loss`, `matmul_mxfp8`, `misc`, `mla`, `mlp_mxfp8`, `moe`, `moe_block`,
+> `moe_mxfp8`, `mxfp_subkernels`, `mxfp_utils`.
+>
+> **Absent: `gdn/`, `sparse_attention_indexer/`, `deepseekv32_mlp/`, `scan/`,
+> `transformer/`.** `gdn` does not appear anywhere in the installed tree.
+> Found by dev2; independently confirmed here.
 
-Every kernel has a `*_torch.py` reference implementation next to it, which is what
-makes CPU-mode validation possible.
+| Directory | Contents | Relevant to | Installed? |
+|---|---|---|---|
+| `gdn/` | `gdn_tkg.py`, `gdn_cte.py`, `gdn_conv1d.py`, `gdn_block_tkg.py`, + `_torch` refs | Qwen3.8-27B; base for GLM-5.3-Flash KDA | **NO** |
+| `mla/deepseek/` | `mla_qkv_cte`, `mla_sparse_attention_cte`, `mla_vup_oproj_cte`, `mla_common_cte`, + `_torch` refs — **prefill only** | GLM-5.3, DeepSeek-V4.1 | yes |
+| `sparse_attention_indexer/` | DeepSeek sparse-attention indexer, top-k | GLM-5.3 DSA | **NO** |
+| `moe_block/`, `moe_mxfp8/`, `moe/` | MoE + EP + MXFP8 | all MoE targets | yes |
+| `deepseekv32_mlp/` | DeepSeek V3.2 MLP | MoE targets | **NO** |
+| `scan/` | linear scan, selective scan (Mamba), SSD (Mamba-2) | linear-attention fallbacks | **NO** |
+| `attention/`, `attention_mxfp8/` | flash CTE/TKG, SWA fused | everything | yes |
+| `transformer/` | megakernels | everything | **NO** |
 
-**Revised view: kernel authoring is roughly 10–20% of a port.** The dominant costs
-are model-level integration (weight mapping, sharding, cache plumbing) and
-fighting the compiler.
+The `mla/deepseek/` listing **confirms §3.4 against the shipped package**: every
+file is `*_cte`, plus `mla_validate_params.py`. There is no decode kernel in the
+installed nkilib either, not just in the checkout.
+
+Every kernel does have a `*_torch.py` reference next to it, which is what makes
+CPU-mode validation possible — for the kernels that ship.
+
+**Revised view, twice over.** Kernel *authoring* may still be 10–20% of a port,
+but the kernels this roadmap leans on hardest — `gdn` for Qwen3.8-27B and as the
+base for GLM-5.3-Flash's KDA, and `sparse_attention_indexer` for GLM-5.3's DSA —
+**are not in the shipped library**. They exist in the GitHub source, so the work
+is vendoring rather than writing, with
+`functional/vendored_kernels/rotational_topk/` as the in-tree precedent. But that
+adds a provenance and version-skew problem that "they already exist" concealed:
+the vendored copy and the bundled `nkilib` will drift, and nothing checks it.
+
+Before relying on any `nkilib/experimental/` module, **check it is installed**.
+For these the question is absence, not version skew.
+
+And check what it is tested against. dev2 found that `gdn_tkg`'s entire upstream
+test table is a **single case** — `test_gdn_tkg.py:88`,
+`test_cases_basic = [(24, 128, 128, bfloat16)]`, which at `NUM_V_HEADS=12` is
+batch 2. `gdn_cte` has both a basic and a large table. So the **decode** kernel
+this roadmap leans on has one test point, and GLM-5.3-Flash needs 64 heads
+against that point's 24.
 
 ### How kernels are wired
 
@@ -267,9 +337,31 @@ HuggingFace configs on 2026-09-24.
 - **55.6 GB / 18 shards.** Fits a single Trainium2 chip with room for KV.
 - transformers reference: `modeling_qwen3_5.py` ✅
 
-Watch: `head_dim: 256` (§3.2), `partial_rotary_factor: 0.25`, interleaved mRoPE
-`[11, 11, 10]`, `attn_output_gate: true` with a swish gate. The RoPE and gating
-details are where silent numerical bugs hide.
+Watch: `partial_rotary_factor: 0.25`, interleaved mRoPE `[11, 11, 10]`, and the
+two **separate** gates — `attn_output_gate: true` is a **sigmoid** on the
+full-attention output, while `output_gate_type: "swish"` is the activation of the
+DeltaNet block's gated RMSNorm (swish ≡ SiLU). Conflating them is easy and wrong.
+
+`head_dim: 256` is **not** a concern here — see §3.2.
+
+All four of those were checked against the `transformers` reference at this
+checkpoint's exact dimensions on 2026-09-25 and match bit-exactly (mRoPE cos/sin,
+partial rotary on q and k, both RMSNorm variants, the attention gate). Note the
+asymmetry the port gets right: the plain RMSNorm scales by `(1 + weight)`, the
+gated one by plain `weight`.
+
+Two further findings from that evaluation:
+
+- **PR #54 needs no new model code for this checkpoint.** `Qwen3_5Config.from_hf`
+  takes the published config unchanged, and all 851 text-decoder tensors are
+  predicted exactly from it (0 mismatched, 0 unexplained, 0 missing).
+- The only tensor-level difference from Qwen3.5-27B is that `linear_attn.A_log`
+  and `linear_attn.norm.weight` moved F32 → BF16. It is already handled:
+  `model.py` coerces `dt_bias`/`A_log` to float32 *before* a
+  `load_state_dict(..., assign=True)`, which would otherwise replace the
+  parameters without casting and run `A_log.exp()` in bf16.
+
+Full write-up: `dev/progress/2026-09-25-qwen38-27b-pr54-findings.md`.
 
 ### MiMo-V2.6-Pro-RL — second
 

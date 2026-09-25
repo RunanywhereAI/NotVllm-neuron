@@ -176,8 +176,17 @@ def _init_backend():
 
     torch.accelerator.current_accelerator = _current_accelerator_wrapper
 
-    # Patch accelerator stream/device APIs for CPU mode to prevent CUDA fallthrough
-    if envs.VLLM_NEURON_CPU_MODE:
+    # Patch accelerator stream/device APIs to prevent CUDA fallthrough, and — under
+    # CPU compilation — to keep torch from reaching for a Neuron backend that is not
+    # linked. ``_current_accelerator_wrapper`` above reports ``neuron`` as the
+    # accelerator when VLLM_NEURON_CPU_COMPILE is set, and torch 2.11's dynamo calls
+    # ``torch.accelerator.current_stream()`` while building a tracing frame
+    # (``_dynamo/variables/streams.py``). On a host with no Neuron runtime that
+    # resolves to ``current_device_index()`` and raises "PyTorch is not linked with
+    # support for neuron devices" from C++, which aborts the trace before any HLO is
+    # emitted. Nothing executes during CPU compilation, so a cpu-shaped stub is
+    # sufficient here.
+    if envs.VLLM_NEURON_CPU_MODE or envs.VLLM_NEURON_CPU_COMPILE:
         torch.accelerator.current_stream = lambda device=None: type(
             "_S", (), {"device": torch.device("cpu")}
         )()
