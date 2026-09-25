@@ -64,6 +64,55 @@ def test_upstream_allowlist_still_lacks_glm5_next():
     )
 
 
+def test_the_staleness_guard_can_actually_detect_adoption():
+    """The negative assertion above passes whether or not the detector works.
+
+    ``test_upstream_allowlist_still_lacks_glm5_next`` asserts the detector
+    returns False against the real allowlist — which it also would if the
+    detector were hardwired to False. It was: the first version searched
+    ``code.co_consts`` for the model-type string, but CPython stores the
+    allowlist tuple as a *single* constant, so the membership test never matched
+    and the guard could never fire.
+
+    So this pins the other direction. Substitute a function whose allowlist does
+    contain the string and require the detector to say so. Without this test, the
+    guard can regress to always-False and the suite stays green.
+    """
+    original = ModelArchConfigConvertorBase.is_deepseek_mla
+    try:
+        # The string must be a LITERAL here. Written as the module constant
+        # ``GLM5_NEXT_TEXT_MODEL_TYPE`` it is a global lookup, so the tuple is
+        # built at runtime and never becomes a code constant — which is how the
+        # first version of this test failed against a working detector.
+        def adopted(self) -> bool:
+            return self.hf_text_config.model_type in (
+                "deepseek_v2",
+                "deepseek_v3",
+                "glm5_next_text",
+            )
+
+        ModelArchConfigConvertorBase.is_deepseek_mla = adopted
+        assert upstream_allowlist_has_glm5_next() is True, (
+            "the staleness guard cannot see an allowlist that DOES contain "
+            f"{GLM5_NEXT_TEXT_MODEL_TYPE!r}; it will never fire and is not a guard"
+        )
+    finally:
+        ModelArchConfigConvertorBase.is_deepseek_mla = original
+
+    # and it still reports the real allowlist correctly afterwards
+    assert upstream_allowlist_has_glm5_next() is False
+
+
+def test_the_staleness_guard_looks_through_our_own_patch():
+    """Once applied, the patch wraps the original; the guard must unwrap it.
+
+    Otherwise it would inspect our wrapper — whose constants do contain the
+    string — and conclude upstream had adopted the model.
+    """
+    apply_mla_detect_patch()
+    assert upstream_allowlist_has_glm5_next() is False
+
+
 def test_the_trap_is_still_there():
     """get_head_size() returns head_dim whenever it is `not None` — and 0 is not None.
 

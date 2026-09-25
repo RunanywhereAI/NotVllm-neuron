@@ -86,6 +86,16 @@ def upstream_allowlist_has_glm5_next() -> bool:
 
     Read from the function's own constants rather than by calling it, so the check
     does not depend on constructing a config.
+
+    **Limitation.** This sees string *literals* in the compiled function. If
+    upstream ever builds the allowlist from module-level names, or from a set
+    constructed at runtime, the constants will not contain the string and this
+    returns False even though vLLM has adopted the model. At the pin it is a
+    literal tuple, which ``_flatten`` unpacks. The failure mode is conservative —
+    we keep patching something upstream now handles — and
+    ``test_the_staleness_guard_can_actually_detect_adoption`` pins the detection
+    path so it cannot silently regress to always-False, which is what it did the
+    first time.
     """
     from vllm.transformers_utils import model_arch_config_convertor as conv
 
