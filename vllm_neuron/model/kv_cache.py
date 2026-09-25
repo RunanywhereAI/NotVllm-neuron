@@ -49,19 +49,6 @@ class RecurrentLayerSpec:
 
 
 @dataclass
-class KVSpec:
-    """
-    Defines the KV cache needs of a model by specifying all layer configurations.
-
-    Contains a list of LayerSpec objects that collectively define the complete
-    KV cache requirements for an entire transformer model.
-    """
-
-    layers: list[LayerSpec]
-    recurrent_layers: list[RecurrentLayerSpec] = field(default_factory=list)
-
-
-@dataclass
 class LatentLayerSpec:
     """Cache specification for an MLA layer whose page also holds its indexer caches.
 
@@ -92,6 +79,20 @@ class LatentLayerSpec:
     kv_lora_rank: int
     dtype: torch.dtype
     page_bytes: int
+
+
+@dataclass
+class KVSpec:
+    """
+    Defines the KV cache needs of a model by specifying all layer configurations.
+
+    Contains a list of LayerSpec objects that collectively define the complete
+    KV cache requirements for an entire transformer model.
+    """
+
+    layers: list[LayerSpec]
+    recurrent_layers: list[RecurrentLayerSpec] = field(default_factory=list)
+    latent_layers: list[LatentLayerSpec] = field(default_factory=list)
 
 
 def state_page_indices(
