@@ -102,3 +102,63 @@ def hf_attention_softmax(attn_weights, query_dtype):
                                              dtype=torch.float32).to(query.dtype)
     """
     return F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_dtype)
+
+
+def hf_experts(hidden_states, top_k_index, top_k_weights, gate_up_proj, down_proj,
+               num_experts, swiglu_limit):
+    """``Glm5NextTextExperts.forward`` + ``_apply_gate``, verbatim.
+
+    Two details worth preserving because they are exactly what a re-implementation
+    drifts on:
+
+    * the routing weight multiplies the expert's **output**, after ``down_proj``, and is
+      indexed ``[token_idx, top_k_pos]`` -- the pair recovered from the one-hot mask, not
+      a positional guess;
+    * ``expert_idx == num_experts`` is **skipped**. That sentinel cannot arise from this
+      router (top-k over ``num_experts`` yields indices ``< num_experts``), so it is
+      unreachable here, but it is in the reference and the oracle has no counterpart.
+    """
+    final = torch.zeros_like(hidden_states)
+    with torch.no_grad():
+        mask = F.one_hot(top_k_index, num_classes=num_experts).permute(2, 1, 0)
+        hit = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero()
+    for expert_idx in hit:
+        expert_idx = expert_idx[0]
+        if expert_idx == num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(mask[expert_idx])
+        gate_up = F.linear(hidden_states[token_idx], gate_up_proj[expert_idx])
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(min=None, max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+        current = F.silu(gate) * up
+        current = F.linear(current, down_proj[expert_idx]) * top_k_weights[token_idx, top_k_pos, None]
+        final.index_add_(0, token_idx, current.to(final.dtype))
+    return final
+
+
+def hf_moe(x, router_weight, e_score_correction_bias, gate_up_proj, down_proj,
+           shared_gate_w, shared_up_w, shared_down_w, *, top_k, n_group, topk_group,
+           norm_topk_prob, routed_scaling_factor, swiglu_limit):
+    """``Glm5NextTextMoE.forward``, verbatim over the vendored router/experts/MLP.
+
+    The three orderings this pins down, each of which is a plausible and silent error:
+
+    1. ``residuals`` is captured **before** anything runs, so the shared expert sees the
+       **layer input**, not the routed output.
+    2. the shared expert is added **after** the routed sum and is **not** multiplied by
+       any routing weight.
+    3. ``routed_scaling_factor`` lives in the **router** (on ``topk_weights``), so it
+       scales the routed path only -- never the shared expert, and exactly once.
+    """
+    residuals = x
+    orig_shape = x.shape
+    _, topk_weights, topk_indices = hf_topk_router(
+        x, router_weight, e_score_correction_bias, top_k, n_group, topk_group,
+        norm_topk_prob, routed_scaling_factor,
+    )
+    num_experts = router_weight.shape[0]
+    flat = x.view(-1, x.shape[-1])
+    routed = hf_experts(flat, topk_indices, topk_weights, gate_up_proj, down_proj,
+                        num_experts, swiglu_limit).view(*orig_shape)
+    return routed + hf_mlp(residuals, shared_gate_w, shared_up_w, shared_down_w, swiglu_limit)
