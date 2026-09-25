@@ -313,14 +313,88 @@ class Glm5NextKDA(nn.Module):
         self._capture("recurrent_state", rec_state)
         return self._finish(core, gate, B, S), (conv_state, rec_state)
 
+    # -- framework surface (state binding is dev3's; the pattern is deltanet.py's) --
+    @property
+    def conv_numel(self) -> int:
+        return (self.p.conv_kernel - 1) * 3 * self.HK
+
+    @property
+    def rec_numel(self) -> int:
+        return self.H * self.K * self.V
+
+    def bind_state_pages(self, pages: torch.Tensor) -> None:
+        """Bind the page-major state view, as ``deltanet.bind_state_pages`` does.
+
+        One row per request, holding ``conv ‖ recurrent`` contiguously. The page is
+        wider than the two states; the remainder is vLLM's padding.
+        """
+        if pages.dim() != 2 or pages.shape[1] < self.conv_numel + self.rec_numel:
+            raise ValueError(
+                f"{self.layer_name}: state page view {tuple(pages.shape)} cannot hold "
+                f"{self.conv_numel} conv + {self.rec_numel} recurrent elements"
+            )
+        self.state_pages = pages
+
+    def _read_states(self, indices: torch.Tensor):
+        rows = self.state_pages.index_select(0, indices)
+        n = rows.shape[0]
+        conv = rows[:, : self.conv_numel].reshape(n, self.p.conv_kernel - 1, 3 * self.HK)
+        rec = rows[:, self.conv_numel : self.conv_numel + self.rec_numel].reshape(
+            n, self.H, self.K, self.V)
+        return conv, rec
+
+    def _write_states(self, indices: torch.Tensor, conv: torch.Tensor, rec: torch.Tensor) -> None:
+        """Both states back as ONE full-width row per page.
+
+        Not two narrow writes: a per-state column slice is non-contiguous, and an
+        in-place write through a strided view of a bound device tensor is what Neuron
+        rejects. Straight from ``deltanet._write_states``, including the zero padding.
+        """
+        n = indices.shape[0]
+        parts = [conv.reshape(n, -1).float(), rec.reshape(n, -1).float()]
+        pad = self.state_pages.shape[1] - self.conv_numel - self.rec_numel
+        if pad:
+            parts.append(torch.zeros(n, pad, dtype=self.state_pages.dtype,
+                                     device=indices.device))
+        self.state_pages.index_copy_(0, indices, torch.cat(parts, dim=1))
+
     def forward(self, hidden_states, positions, attn_metadata: dict) -> torch.Tensor:
         """Framework entry point. Returns a plain tensor; state goes to the KV cache.
 
-        NOT YET WIRED: dev3 owns the cache plumbing, so the state read/write is left
-        as the one seam rather than guessed at. Everything above this line is
-        complete and tested against the oracle.
+        ``state_indices`` returns a *pair* for a reason worth not rediscovering: padded
+        batch rows must READ a zero page (a dead row reading another group's bytes as
+        float32 hands NaN logits to every live row, because the sampler's argmax
+        reduces across the whole tile) and must WRITE somewhere else (writing the zero
+        page is what would stop it being zeros). That helper is ``deltanet``'s and
+        belongs in shared code rather than copied here — flagged to dev3.
+        """
+        if not hasattr(self, "state_pages"):
+            raise RuntimeError(
+                f"{self.layer_name}: bind_state_pages() has not been called; the "
+                f"runner binds state before the first forward"
+            )
+        metadata = attn_metadata[self.layer_name]
+        num_reqs = metadata["block_table_tensor"].shape[0]
+        read_idx, write_idx = self.state_indices(metadata, num_reqs)
+        conv, rec = self._read_states(read_idx)
+        if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
+            out, (conv, rec) = self.forward_decode(hidden_states, conv, rec)
+        else:
+            out, (conv, rec) = self.forward_prefill(hidden_states, conv, rec)
+        self._write_states(write_idx, conv, rec)
+        return out
+
+    def state_indices(self, metadata: dict, num_reqs: int):
+        """NOT IMPLEMENTED HERE ON PURPOSE.
+
+        ``deltanet.state_indices`` is ~40 lines of padded-batch redirect logic with
+        two version-sensitive details (vLLM 0.24 changed the padding sentinel from
+        ``PAD_SLOT_ID`` -1 to ``NULL_BLOCK_ID`` 0, and an out-of-range page id is an
+        out-of-bound indirect DMA on device rather than a wrapped index). Copying it
+        would put a second copy of that reasoning in the tree, which is how the two
+        drift apart. It should be lifted into shared code; raised with dev3, who owns
+        the cache surface.
         """
         raise NotImplementedError(
-            "state binding is dev3's surface; call forward_prefill/forward_decode "
-            "directly until the cache plumbing lands"
+            "lift deltanet.state_indices into shared code and call it here"
         )
