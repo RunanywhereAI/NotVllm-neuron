@@ -66,6 +66,21 @@ GLM5_NEXT_TEXT_MODEL_TYPE = "glm5_next_text"
 _applied = False
 
 
+def _flatten(consts) -> set:
+    """Constants, with tuple literals unpacked one level.
+
+    ``co_consts`` holds a tuple literal as a single entry, so a membership test
+    against it silently misses every string inside the allowlist.
+    """
+    out = set()
+    for c in consts:
+        if isinstance(c, (tuple, frozenset)):
+            out.update(x for x in c if isinstance(x, str))
+        elif isinstance(c, str):
+            out.add(c)
+    return out
+
+
 def upstream_allowlist_has_glm5_next() -> bool:
     """True once vLLM recognises GLM-5.3-Flash itself, making this patch redundant.
 
@@ -74,12 +89,16 @@ def upstream_allowlist_has_glm5_next() -> bool:
     """
     from vllm.transformers_utils import model_arch_config_convertor as conv
 
-    fn = getattr(conv.ModelArchConfigConvertorBase.is_deepseek_mla, "__wrapped_original__",
+    fn = getattr(conv.ModelArchConfigConvertorBase.is_deepseek_mla,
+                 "__wrapped_original__",
                  conv.ModelArchConfigConvertorBase.is_deepseek_mla)
-    consts = getattr(fn, "__code__", None)
-    if consts is None:
+    code = getattr(fn, "__code__", None)
+    if code is None:
         return False
-    return GLM5_NEXT_TEXT_MODEL_TYPE in consts.co_consts
+    # The allowlist is a tuple literal, which CPython stores as ONE constant.
+    # Searching co_consts for the string directly never matches — the first
+    # version of this function did exactly that and could never fire.
+    return GLM5_NEXT_TEXT_MODEL_TYPE in _flatten(code.co_consts)
 
 
 def apply_mla_detect_patch() -> None:
