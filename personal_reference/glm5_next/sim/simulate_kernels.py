@@ -10,6 +10,9 @@ than only a printout. This replaces five ad-hoc scripts that lived only in ``~/k
 on one machine: the two kernels that took the most work to get right were validated
 by code nobody else could reach.
 
+The kernels themselves live in ``vllm_neuron/model/glm5_next/`` (they are production
+code); this harness loads them **by path** so that neither it nor they require vLLM.
+
 What it checks, and why each one is here rather than being a nice-to-have:
 
 * **vs the fp32 oracle.** ``recurrent_kda`` + ``RMSNormGated`` for decode,
@@ -56,8 +59,46 @@ import nki.language as nl  # noqa: E402
 import neuron_dtypes as dt  # noqa: E402
 
 from glm5_next import reference as R  # noqa: E402
-from glm5_next.nki_kda_tkg import kda_tkg, RMS_NORM_EPS  # noqa: E402
-from glm5_next.nki_kda_cte import kda_cte  # noqa: E402
+
+
+def _load_kernels():
+    """Load the kernels BY PATH, not as ``vllm_neuron.model.glm5_next.*``.
+
+    The kernels live in the plugin (production code); the oracle lives here
+    (reference material). Importing them as a package would execute
+    ``vllm_neuron/__init__.py``, which pulls in vLLM — and this harness must run on a
+    box that has the Neuron toolchain but not necessarily vLLM. Loading by path keeps
+    that property; ``vllm_neuron/model/glm5_next/__init__.py`` is deliberately empty
+    for the same reason.
+
+    Override with ``GLM5NEXT_KERNELS=<dir>`` if the tree is laid out differently, e.g.
+    when only part of the repo has been copied to a machine.
+    """
+    import importlib.util
+    import os
+
+    env = os.environ.get("GLM5NEXT_KERNELS")
+    cand = (pathlib.Path(env) if env
+            else _HERE.parents[3] / "vllm_neuron" / "model" / "glm5_next")
+    mods = {}
+    for name in ("nki_kda_tkg", "nki_kda_cte"):
+        f = cand / f"{name}.py"
+        if not f.is_file():
+            raise SystemExit(
+                f"kernel not found: {f}\n"
+                f"Copy the repo subtree, or set GLM5NEXT_KERNELS to the directory "
+                f"holding nki_kda_tkg.py and nki_kda_cte.py."
+            )
+        spec = importlib.util.spec_from_file_location(name, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        mods[name] = m
+    return mods
+
+
+_K = _load_kernels()
+kda_tkg, RMS_NORM_EPS = _K["nki_kda_tkg"].kda_tkg, _K["nki_kda_tkg"].RMS_NORM_EPS
+kda_cte = _K["nki_kda_cte"].kda_cte
 
 K = V = 128
 FAILURES: list[str] = []
