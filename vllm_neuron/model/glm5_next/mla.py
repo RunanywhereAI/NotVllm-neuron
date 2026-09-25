@@ -146,6 +146,63 @@ def select_tokens(scores, lens, topk, kpool):
     return torch.cat([out, tail.expand(B, S, -1)], -1)
 
 
+@dataclass
+class IndexerState:
+    """The indexer's carried state — vLLM's two indexer caches, minus paging.
+
+    ``pool_k``    ``[B, P, D]``      compressed COMPLETE pools; scoring reads only this
+    ``tail_k``    ``[B, kpool, D]``  raw K ring, slot ``pos % kpool``
+    ``tail_gate`` ``[B, kpool, D]``  raw gate ring, same slots
+    ``length``    tokens seen so far
+
+    Attention never reads any of it — it gathers latents by token index. On device
+    these three regions live in the latent page (dev3's ``cache_layout.py``); here
+    they are explicit so the decode path can be tested without the cache.
+    """
+
+    pool_k: torch.Tensor
+    tail_k: torch.Tensor
+    tail_gate: torch.Tensor
+    length: int
+
+
+def indexer_prefill(state, k, gate, ape, kpool):
+    """Append S tokens, completing every pool possible and reseeding the tail ring."""
+    B, S, D = k.shape
+    if state is None:
+        z = k.new_zeros(B, kpool, D)
+        state = IndexerState(k.new_zeros(B, 0, D), z, z.clone(), 0)
+    r = state.length % kpool                       # tokens of the incomplete pool
+    raw_k = torch.cat([state.tail_k[:, :r], k], 1)
+    raw_g = torch.cat([state.tail_gate[:, :r], gate], 1)
+    n = raw_k.shape[1] // kpool
+    pools = kpool_compress(raw_k[:, : n * kpool].unflatten(1, (n, kpool)),
+                           raw_g[:, : n * kpool].unflatten(1, (n, kpool)), ape)
+    tail_k, tail_g = state.tail_k.clone(), state.tail_gate.clone()
+    for i in range(max(0, S - kpool), S):
+        slot = (state.length + i) % kpool
+        tail_k[:, slot], tail_g[:, slot] = k[:, i], gate[:, i]
+    return IndexerState(torch.cat([state.pool_k, pools], 1), tail_k, tail_g,
+                        state.length + S)
+
+
+def indexer_decode(state, k, gate, ape, kpool):
+    """One token: complete a pool if this token closes one, then stash it.
+
+    EVERY token is stashed, not only pool-completing ones. vLLM once gated the stash
+    on completion and thereafter compressed stale prompt-tail entries forever.
+    """
+    slot = state.length % kpool
+    pool_k = state.pool_k
+    if slot == kpool - 1:
+        ks = torch.cat([state.tail_k[:, :slot], k], 1)
+        gs = torch.cat([state.tail_gate[:, :slot], gate], 1)
+        pool_k = torch.cat([pool_k, kpool_compress(ks, gs, ape)[:, None]], 1)
+    tail_k, tail_g = state.tail_k.clone(), state.tail_gate.clone()
+    tail_k[:, slot], tail_g[:, slot] = k[:, 0], gate[:, 0]
+    return IndexerState(pool_k, tail_k, tail_g, state.length + 1)
+
+
 class Glm5NextIndexer(nn.Module):
     """DSA lightning indexer with kpool compression.
 
@@ -166,8 +223,13 @@ class Glm5NextIndexer(nn.Module):
         self.index_kpool_compress_ape = nn.Parameter(torch.zeros(p.index_kpool, D))
         self.index_kpool_compress_gate = nn.Parameter(torch.randn(D, p.hidden_size) * 0.02)
 
-    def forward(self, x, q_c, pool_k=None):
-        """-> token indices ``[B, S, index_topk + index_kpool - 1]``, ``-1`` padded.
+    def forward(self, x, q_c, state=None):
+        """-> (token indices ``[B, S, topk + kpool - 1]``, new ``IndexerState``).
+
+        State is threaded rather than recomputed. Getting this wrong is not subtle but
+        it IS invisible in a prefill-only test: on decode the layer re-pooled from the
+        single new token, found no complete pool, and computed positions from the
+        local length — so the token attended to itself alone, 1 of 21 positions.
 
         No RoPE: ``qk_rope_head_dim`` is 0, so ``indexer_rope_interleave`` is inert.
         """
@@ -176,11 +238,12 @@ class Glm5NextIndexer(nn.Module):
         k = self.k_norm(self.wk(x))
         gate = F.linear(x, self.index_kpool_compress_gate)
         w = self.weights_proj(x).float() * self.Hi ** -0.5
-        if pool_k is None:                                # prefill: pool this sequence
-            n = S // self.p.index_kpool
-            kk = k[:, : n * self.p.index_kpool].unflatten(1, (n, self.p.index_kpool))
-            gg = gate[:, : n * self.p.index_kpool].unflatten(1, (n, self.p.index_kpool))
-            pool_k = kpool_compress(kk, gg, self.index_kpool_compress_ape)
+        ape = self.index_kpool_compress_ape
+        if state is not None and S == 1:
+            state = indexer_decode(state, k, gate, ape, self.p.index_kpool)
+        else:
+            state = indexer_prefill(state, k, gate, ape, self.p.index_kpool)
+        pool_k = state.pool_k
         scores = (w[:, :, None, :].float() @ F.relu(
             (q.float() @ pool_k.float().transpose(-1, -2).unsqueeze(1)) * self.D ** -0.5)
         ).squeeze(-2)
@@ -188,10 +251,12 @@ class Glm5NextIndexer(nn.Module):
         # CORRECT fp8 device, so the scores are what distinguish a near-tie swap from
         # a real defect. Indices alone cannot.
         _capture_tensor(f"{self.layer_name}.indexer.scores", scores)
-        lens = torch.arange(S, device=x.device) + 1
+        # ABSOLUTE positions, not local: on decode the query sits at state.length - 1,
+        # not at 0. Using local positions is what made the decode token select nothing.
+        lens = torch.arange(state.length - S, state.length, device=x.device) + 1
         idx = select_tokens(scores, lens, self.p.index_topk, self.p.index_kpool)
         _capture_tensor(f"{self.layer_name}.indexer.topk_indices", idx)
-        return idx
+        return idx, state
 
 
 def indices_to_mask(idx, L):
@@ -239,8 +304,9 @@ class Glm5NextSparseMLA(nn.Module):
         w = self.kv_b_proj.weight.view(self.H, self.qk + self.vd, self.kvr)
         return w[:, : self.qk, :], w[:, self.qk :, :]
 
-    def forward_core(self, hidden_states, kv_cache=None, topk_indices=None):
-        """-> (output ``[B,S,D]``, latent ``[B,L,kvr]``).
+    def forward_core(self, hidden_states, kv_cache=None, topk_indices=None,
+                     indexer_state=None):
+        """-> (output ``[B,S,D]``, (latent ``[B,L,kvr]``, ``IndexerState``)).
 
         Absorbed form: ``q @ W_uk`` scores directly against the latent, and V-up is
         applied *after* attention. Returning the latent is for tests and for callers
@@ -264,7 +330,7 @@ class Glm5NextSparseMLA(nn.Module):
         q_abs = torch.einsum("bshq,hqr->bshr", q.float(), W_uk.float())
         att = torch.einsum("bshr,blr->bhsl", q_abs, latent.float()) * self.scaling
 
-        own = self.indexer(hidden_states, q_c)
+        own, indexer_state = self.indexer(hidden_states, q_c, indexer_state)
         idx = own if topk_indices is None else topk_indices
         mask = indices_to_mask(idx.long(), L).unsqueeze(1)
         att = att.masked_fill(~mask, float("-inf")).softmax(-1, dtype=torch.float32)
@@ -273,7 +339,8 @@ class Glm5NextSparseMLA(nn.Module):
         mixed = torch.einsum("bhsl,blr->bshr", att, latent.float())
         out = torch.einsum("bshr,hvr->bshv", mixed, W_uv.float())
         _capture_tensor(f"{self.layer_name}.attn_pre_oproj", out)
-        return self.o_proj(out.reshape(B, S, -1).to(hidden_states.dtype)), latent
+        return (self.o_proj(out.reshape(B, S, -1).to(hidden_states.dtype)),
+                (latent, indexer_state))
 
     def forward(self, hidden_states, positions, attn_metadata: dict) -> torch.Tensor:
         """Framework entry point.
