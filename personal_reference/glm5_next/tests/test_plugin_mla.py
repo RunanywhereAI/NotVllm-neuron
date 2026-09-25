@@ -79,7 +79,7 @@ def test_absorbed_attention_matches_the_oracle(S):
     m, o = _pair()
     x = _x(S, seed=S)
     with torch.no_grad():
-        got, latent = m.forward_core(x)
+        got, (latent, _) = m.forward_core(x)
         # the oracle returns (out, (latent, indexer_state)) since it carries its own
         # indexer state; the plugin keeps state in the KV cache instead.
         want, (o_latent, _) = o(x)
@@ -134,7 +134,7 @@ def test_the_latent_is_one_tensor_serving_as_both_k_and_v():
     m, _ = _pair()
     x = _x(10, seed=4)
     with torch.no_grad():
-        _, latent = m.forward_core(x)
+        _, (latent, _) = m.forward_core(x)
     assert latent.shape == (1, 10, KVR), "one latent per token, not separate K and V"
 
 
@@ -145,7 +145,7 @@ def test_indexer_selects_everything_below_the_ceiling():
     m, _ = _pair()
     x = _x(19, seed=6)
     with torch.no_grad():
-        idx = m.indexer(x, m.q_a_layernorm(m.q_a_proj(x)))
+        idx, _ = m.indexer(x, m.q_a_layernorm(m.q_a_proj(x)))
     mask = MLA.indices_to_mask(idx.long(), 19)[0]
     causal = torch.ones(19, 19, dtype=torch.bool).tril()
     assert torch.equal(mask, causal), "must be exactly causal at or below the ceiling"
@@ -156,7 +156,7 @@ def test_indexer_drops_tokens_above_the_ceiling():
     S = 40
     x = _x(S, seed=7)
     with torch.no_grad():
-        idx = m.indexer(x, m.q_a_layernorm(m.q_a_proj(x)))
+        idx, _ = m.indexer(x, m.q_a_layernorm(m.q_a_proj(x)))
     mask = MLA.indices_to_mask(idx.long(), S)[0]
     causal = torch.ones(S, S, dtype=torch.bool).tril()
     assert not (mask & ~causal).any(), "selected a future token"
@@ -175,8 +175,8 @@ def test_only_complete_pools_are_scored():
     x2[:, t:] += 3 * torch.randn_like(x2[:, t:])
     with torch.no_grad():
         qc = lambda z: m.q_a_layernorm(m.q_a_proj(z))
-        a = MLA.indices_to_mask(m.indexer(x, qc(x)).long(), S)
-        b = MLA.indices_to_mask(m.indexer(x2, qc(x2)).long(), S)
+        a = MLA.indices_to_mask(m.indexer(x, qc(x))[0].long(), S)
+        b = MLA.indices_to_mask(m.indexer(x2, qc(x2))[0].long(), S)
     assert torch.equal(a[:, :t], b[:, :t]), "future tokens moved an earlier selection"
     assert not torch.equal(a[:, t:], b[:, t:]), "perturbation had no effect at all"
 
@@ -226,3 +226,58 @@ def test_capture_points_fire_and_carry_tensors(monkeypatch):
 
 def test_layer_imports_without_vllm():
     assert "vllm" not in sys.modules
+
+
+# ---------------------------------------------------- decode, and its state handoff
+# Prefill correctness does NOT imply decode correctness. Before the indexer carried
+# state, decode re-pooled from the single new token, found no complete pool, and
+# computed positions from the local length — so the token attended to ITSELF ALONE,
+# 1 of 21 positions, while every prefill test passed. That is the same class of bug
+# as the KDA conv-window handoff, and it is invisible without a decode test.
+
+@pytest.mark.parametrize("S0", [16, 17, 18, 19])
+def test_prefill_then_decode_equals_one_shot_prefill(S0):
+    """Every S0 % kpool, so the tail ring is exercised at each phase."""
+    m, _ = _pair()
+    S1 = S0 + 9
+    x = _x(S1, seed=S0)
+    with torch.no_grad():
+        full, _ = m.forward_core(x)
+        out, (lat, st) = m.forward_core(x[:, :S0])
+        outs = [out]
+        for t in range(S0, S1):
+            o, (lat, st) = m.forward_core(x[:, t:t + 1], kv_cache=lat, indexer_state=st)
+            outs.append(o)
+    got = torch.cat(outs, 1)
+    assert st.length == S1
+    rel = (got - full).abs().max() / full.abs().max()
+    assert rel < 1e-4, f"S0={S0}: prefill/decode disagree by {rel:.2e}"
+
+
+def test_decode_selects_the_right_number_of_tokens():
+    """The arithmetic the fix restored: covered(L) = min(L//k, topk//k)*k + L%k."""
+    m, _ = _pair()
+    x = _x(30, seed=12)
+    with torch.no_grad():
+        _, (lat, st) = m.forward_core(x[:, :20])
+        for t in range(20, 30):
+            idx, st = m.indexer(x[:, t:t + 1], m.q_a_layernorm(m.q_a_proj(x[:, t:t + 1])), st)
+            L = t + 1
+            want = min(L // KPOOL, TOPK // KPOOL) * KPOOL + L % KPOOL
+            got = int(MLA.indices_to_mask(idx.long(), L)[0, 0].sum())
+            assert got == want, f"L={L}: attends to {got}, expected {want}"
+
+
+def test_every_token_is_stashed_not_only_pool_completing_ones():
+    """vLLM once gated the tail stash on pool completion and thereafter compressed
+    stale prompt-tail entries forever. The ring must advance on every token."""
+    m, _ = _pair()
+    x = _x(12, seed=13)
+    with torch.no_grad():
+        _, (_, st) = m.forward_core(x[:, :8])
+        rings = []
+        for t in range(8, 12):
+            _, st = m.indexer(x[:, t:t + 1], m.q_a_layernorm(m.q_a_proj(x[:, t:t + 1])), st)
+            rings.append(st.tail_k.clone())
+    for a, b in zip(rings, rings[1:]):
+        assert not torch.equal(a, b), "the tail ring did not advance on a token"
