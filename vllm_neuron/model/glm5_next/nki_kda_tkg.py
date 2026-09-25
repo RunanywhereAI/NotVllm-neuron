@@ -171,6 +171,14 @@ def kda_tkg(
         z (nl.NkiTensor): [BH, V] @ HBM, RMSNormGated gate input (pre-sigmoid).
         norm_weight (nl.NkiTensor): [V] @ HBM, RMSNormGated weight (gamma).
         state_in (nl.NkiTensor): [BH, K, V] @ HBM fp32, incoming recurrent state.
+            ``kda_cte``'s ``state_output`` hands over here directly — same shape,
+            dtype and head ordering, verified end to end under simulation
+            (``sim/simulate_kernels.py::run_chain``). But **the two kernels do not
+            share an input contract**: this one takes RAW q/k and RAW pre-sigmoid
+            ``b``, while ``kda_cte`` takes already-l2-normed q/k and POST-sigmoid
+            ``beta``. Only ``beta`` actually bites — ``l2norm`` is idempotent to
+            5e-7, whereas double-sigmoid compresses 0.48-0.70 into 0.62-0.67 and
+            costs ~5% of the output.
 
     Returns:
         out (nl.NkiTensor): [BH, V] @ HBM, RMSNormGated decode output (bf16).
