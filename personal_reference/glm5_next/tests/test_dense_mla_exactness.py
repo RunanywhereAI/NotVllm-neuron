@@ -3,9 +3,13 @@
 
 Run: python3 -m pytest personal_reference/glm5_next/tests/test_dense_mla_exactness.py -v
 
-**Answer: yes, and the ceiling is seq_len <= index_topk == 2048.** Above that the
-oracle is not approximate, it is *wrong* — it attends to tokens the model's
-indexer would have excluded.
+**Answer: yes, and the ceiling is seq_len <= 2051.** Above that the oracle is not
+approximate, it is *wrong* — it attends to tokens the model's indexer excludes.
+
+Two numbers that are easy to conflate, and are kept apart below: **2051** is the
+exactness boundary (``floor(S / kpool) <= index_topk // kpool``), while **2048** is
+vLLM's own shortcut threshold (``seq_len <= index_topk``), conservative by three
+tokens.
 
 This was checked against vLLM's implementation rather than by re-deriving the
 arithmetic, because the arithmetic was never the risk. The risk was the meaning of
@@ -49,12 +53,9 @@ own fast path, taken for the same reason.
 
 The tests below pin each of these so a config change trips them:
 
-1. ``index_topk == 2048`` — vLLM compares ``seq_len <= topk_tokens`` directly, and
-   ``topk_tokens`` *is* ``index_topk``.
-2. ``index_topk % index_kpool == 0``. The pool-count derivation
-   (``ceil(S / kpool) <= index_topk // kpool``) and vLLM's direct
-   ``S <= index_topk`` give the same 2048 **only because 2048 % 4 == 0**. With a
-   non-dividing ``index_kpool`` they diverge and vLLM's is authoritative.
+1. ``index_topk == 2048`` — vLLM's shortcut compares ``seq_len <= topk_tokens``
+   directly, and ``topk_tokens`` *is* ``index_topk``.
+2. ``index_topk % index_kpool == 0``, or both numbers need re-deriving.
 3. ``index_kpool_compress`` stays confined to the indexer cache.
 4. ``index_kpool_always_select_tail`` keeps appending raw tail tokens.
 5. ``indexer_types`` is ``"full"`` on all 45 layers — a layer with a different
@@ -62,14 +63,14 @@ The tests below pin each of these so a config change trips them:
 
 ### Consequence for the roadmap
 
-Milestone 2's scope is **1M context**. This oracle is only valid to 2048 tokens,
-so it cannot validate long-context behaviour at all. Anything past 2048 needs a
+Milestone 2's scope is **1M context**. This oracle is only valid to 2051 tokens,
+so it cannot validate long-context behaviour at all. Anything past 2051 needs a
 real indexer in the oracle. That is a scoping fact, not a defect.
 """
 from __future__ import annotations
 
 import json
-import math
+
 import os
 import pathlib
 
@@ -79,7 +80,25 @@ import pytest
 INDEX_TOPK = 2048
 INDEX_KPOOL = 4
 NUM_LAYERS = 45
-DENSE_EXACT_MAX_SEQ_LEN = INDEX_TOPK
+
+# The true exactness boundary is 2051, not 2048.
+#
+# Corrected by dev2 (2026-09-25), who matched the indexer against transformers
+# 5.17 and vLLM at real geometry. Only *complete* pools are candidates —
+# floor(S / kpool) of them — because the trailing incomplete pool never enters the
+# compressed pool cache at all: vLLM holds it in a separate ``Glm5NextTailCache``
+# as raw K and appends it as tokens. My original derivation used ceil(S / kpool),
+# which wrongly counted that incomplete pool as needing a selection slot.
+#
+#   floor(S / 4) <= 512  <=>  S <= 2051
+DENSE_EXACT_MAX_SEQ_LEN = 2051
+
+# vLLM's own fast path is gated on ``seq_len <= topk_tokens`` where
+# ``topk_tokens = config.index_topk`` — read directly from
+# ``vllm/models/glm5next/nvidia/sparse_indexer.py``. It is conservative by three
+# tokens: between 2049 and 2051 the sparse path still selects everything, vLLM
+# just does not bother taking the shortcut.
+VLLM_SHORTCUT_MAX_SEQ_LEN = INDEX_TOPK
 
 
 def _live_config():
@@ -97,55 +116,61 @@ def _live_config():
     }
 
 
+def _complete_pools(seq_len: int, kpool: int) -> int:
+    """Candidate pools for selection: complete ones only.
+
+    The trailing incomplete pool is not a candidate — it lives in the tail cache
+    as raw K and is appended as tokens regardless of selection.
+    """
+    return seq_len // kpool
+
+
 def test_threshold_is_index_topk():
     """vLLM's gate is ``seq_len <= topk_tokens`` and ``topk_tokens = index_topk``."""
     cfg = _live_config()
     assert cfg["index_topk"] == INDEX_TOPK
-    assert DENSE_EXACT_MAX_SEQ_LEN == cfg["index_topk"]
+    assert VLLM_SHORTCUT_MAX_SEQ_LEN == cfg["index_topk"]
 
 
-def test_pool_derivation_agrees_with_vllms_direct_check():
-    """Both routes give 2048 — but only because index_topk divides by index_kpool.
+def test_exactness_boundary_is_2051_not_the_vllm_shortcut_threshold():
+    """The two numbers are different things; keep them apart.
 
-    Pool route: n_pools = ceil(S / kpool) must be <= select_k = index_topk // kpool.
-    vLLM route: S <= index_topk.
+    Exactness holds while every complete pool fits: floor(S / kpool) <= select_k.
+    vLLM's shortcut triggers at S <= index_topk, three tokens earlier, because it
+    compares the token count rather than the complete-pool count.
     """
     cfg = _live_config()
     topk, kpool = cfg["index_topk"], cfg["index_kpool"]
-    assert topk % kpool == 0, (
-        f"index_topk {topk} no longer divides by index_kpool {kpool}; the pool-count "
-        f"derivation and vLLM's S <= index_topk check now disagree, and vLLM's is "
-        f"authoritative. Re-derive the ceiling."
-    )
     select_k = topk // kpool
-    # largest S with ceil(S / kpool) <= select_k
-    largest = select_k * kpool
-    assert largest == topk == DENSE_EXACT_MAX_SEQ_LEN
+    assert _complete_pools(DENSE_EXACT_MAX_SEQ_LEN, kpool) == select_k
+    assert _complete_pools(DENSE_EXACT_MAX_SEQ_LEN + 1, kpool) > select_k, (
+        "2051 is not the boundary any more; re-derive it"
+    )
+    assert VLLM_SHORTCUT_MAX_SEQ_LEN < DENSE_EXACT_MAX_SEQ_LEN
+    assert DENSE_EXACT_MAX_SEQ_LEN - VLLM_SHORTCUT_MAX_SEQ_LEN == kpool - 1
 
-    # and it really is the largest: one more token needs one more pool
-    assert math.ceil((largest + 1) / kpool) > select_k
+
+def test_pool_arithmetic_depends_on_topk_dividing_kpool():
+    """If index_topk stops dividing by index_kpool, re-derive both numbers."""
+    cfg = _live_config()
+    assert cfg["index_topk"] % cfg["index_kpool"] == 0
 
 
-@pytest.mark.parametrize("seq_len", [1, 2, 3, 4, 5, 64, 2047, 2048])
+@pytest.mark.parametrize("seq_len", [1, 2, 3, 4, 5, 64, 2047, 2048, 2050, 2051])
 def test_every_pool_selected_at_or_below_the_ceiling(seq_len):
     cfg = _live_config()
     topk, kpool = cfg["index_topk"], cfg["index_kpool"]
-    n_pools = math.ceil(seq_len / kpool)
-    assert n_pools <= topk // kpool, f"S={seq_len} needs {n_pools} pools"
+    assert _complete_pools(seq_len, kpool) <= topk // kpool, (
+        f"S={seq_len} needs {_complete_pools(seq_len, kpool)} complete pools"
+    )
 
 
-@pytest.mark.parametrize("seq_len", [2049, 4096, 1 << 20])
+@pytest.mark.parametrize("seq_len", [2052, 4096, 1 << 20])
 def test_above_the_ceiling_the_oracle_is_wrong_not_approximate(seq_len):
-    """Past 2048 the indexer genuinely excludes tokens the dense oracle attends to."""
+    """Past 2051 the indexer genuinely excludes tokens the dense oracle attends to."""
     cfg = _live_config()
     topk, kpool = cfg["index_topk"], cfg["index_kpool"]
-    n_pools = math.ceil(seq_len / kpool)
-    assert n_pools > topk // kpool
-    excluded_pools = n_pools - topk // kpool
-    assert excluded_pools > 0, (
-        f"S={seq_len}: expected the indexer to exclude pools; if it does not, "
-        f"the ceiling is higher than documented"
-    )
+    assert _complete_pools(seq_len, kpool) > topk // kpool
 
 
 def test_compress_and_tail_flags_are_as_assumed():
@@ -171,5 +196,5 @@ def test_all_layers_use_the_full_indexer():
 
 
 def test_oracle_cannot_cover_the_million_token_target():
-    """Recorded deliberately: Milestone 2 wants 1M context, the oracle reaches 2048."""
+    """Recorded deliberately: Milestone 2 wants 1M context, the oracle reaches 2051."""
     assert DENSE_EXACT_MAX_SEQ_LEN < (1 << 20)
