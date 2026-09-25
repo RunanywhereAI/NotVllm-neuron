@@ -162,13 +162,36 @@ class NeuronPlatform(Platform):
         """Register Neuron model architectures before ModelConfig validation."""
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
             )
+
+        # GLM-5.3-Flash is DeepSeek-style MLA, but vLLM 0.24.0's is_deepseek_mla
+        # allowlist has no 'glm5_next_text', so get_head_size() would read the
+        # checkpoint's head_dim of 0 instead of kv_lora_rank + qk_rope_head_dim.
+        # Applied here rather than at plugin import: touching
+        # vllm.transformers_utils at import time pulls in vllm.config and trips a
+        # circular import, the same hazard pin_memory_patch documents. This hook
+        # runs from engine/arg_utils.py before ModelConfig validation, which is
+        # both late enough to be safe and early enough to matter.
+        from vllm_neuron.vllm.patches.mla_detect_patch import apply_mla_detect_patch
+
+        apply_mla_detect_patch()
+
+        # vLLM 0.24.0's registry has no glm5_next entry of any kind. The plugin
+        # registers its models in neuron_worker.py, which is too late: ModelConfig
+        # validation happens in the front end, before any worker exists, and an
+        # unknown architecture fails there. Nothing upstream can overwrite this
+        # one (the CHRYS-72 hazard behind the worker-side registration), because
+        # vLLM has never heard of this architecture.
+        ModelRegistry.register_model(
+            "Glm5NextForConditionalGeneration",
+            "vllm_neuron.model.glm5_next:Glm5NextForConditionalGeneration",
+        )
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
