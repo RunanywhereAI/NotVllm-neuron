@@ -1,7 +1,9 @@
 # GLM-5.3-Flash attention layers — file layout and interfaces
 
 Written for **dev3** (composing these into `model.py`) and **dev1** (config/factory),
-by dev2, 2026-09-25. Branch `glm5next-attention`. **Proposal — not yet implemented.**
+by dev2, 2026-09-25. Branch `glm5next-attention`. **Implemented**: `kda.py` and `mla.py` exist and are validated against the
+oracle (28 tests). The framework seams — state indices, the latent page layout — are
+still open and marked in the code.
 
 Read §5 first if you only read one part: the capture design is the thing that is hard
 to retrofit and easy to omit.
@@ -178,7 +180,21 @@ otherwise buried inside selection divergence.
 
 ---
 
-## 6. Order of work
+## 6. Two hazards for whoever registers these
+
+* **vLLM silently caches model info** to `~/.cache/vllm/modelinfos/<module>-<class>.json`
+  and nothing invalidates it on edit. dev1 lost four wrong diagnoses to this: an early
+  registration cached `is_text_generation_model: false`, and every later source fix was
+  correct and had no effect. If a registration or interface change appears not to work,
+  `rm -rf ~/.cache/vllm/modelinfos` **before** debugging anything else. These two
+  classes will change shape repeatedly, so this is the likeliest trap here.
+* **A converted checkpoint must drop `quantization_config`**, not merely dequantize.
+  vLLM's `ModelConfig` refuses an fp8-advertising checkpoint in its front end, before
+  any plugin code runs — `"fp8 quantization is currently not supported in cpu"` — with
+  no visible connection to the converter. Use `weight_converter.converted_config()`,
+  which drops it at every level and asserts none survived.
+
+## 7. Order of work
 
 1. This document, and any corrections from dev1/dev3.
 2. `kda.py` against the oracle's `LinearAttention`, torch fallback first, then kernels.
