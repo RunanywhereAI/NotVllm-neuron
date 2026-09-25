@@ -23,7 +23,23 @@ The two `nki_*` files follow PR #54's convention exactly — `qwen3_5/` keeps
 `nki_deltanet.py` and `nki_deltanet_fused.py` beside `deltanet.py`, so kernels live in
 the model directory rather than a shared kernel home.
 
-### Where the kernels come from — needs a decision
+### Kernel home — settled, and the dispatch is NOT wired
+
+The kernels now live in `vllm_neuron/model/glm5_next/`, following PR #54's
+convention, and `sim/simulate_kernels.py` loads them **by file path** so neither it
+nor they require vLLM.
+
+> **The plugin layers do not call the kernels.** `kda.py` runs its torch path only;
+> the NKI dispatch is deliberately unwired until dev3's seams land. So "the layers
+> are validated" and "the kernels are validated" are two true statements about two
+> things that **have never run together through the plugin**. Wiring the dispatch
+> creates a new composition, and per §8 that needs its own test before it is trusted.
+
+The indexer is torch-only everywhere — no NKI indexer kernel exists. That is a
+performance item, not a correctness one, but it is on the decode path for 11 of 45
+layers.
+
+### Historical: where they came from
 
 They exist on branch `glm53-indexer` at `personal_reference/glm5_next/nki_kda_*.py`,
 which this branch does not have. That directory is also the **oracle's** home, and the
@@ -85,9 +101,20 @@ These cost real errors during the kernel work and are easy to get wrong again:
 
 ```python
 class Glm5NextSparseMLA(nn.Module):
-    def __init__(self, config, layer_idx: int): ...
+    def __init__(self, config, layer_idx: int, tp_size: int = 1): ...
     def forward(self, hidden_states, positions, attn_metadata: dict) -> torch.Tensor
+    # the tested path, until dev3's cache seams land:
+    def forward_core(self, hidden_states, kv_cache=None, topk_indices=None,
+                     indexer_state=None) -> tuple[Tensor, tuple[Tensor, IndexerState]]
 ```
+
+**The indexer carries state, and getting that wrong is invisible in prefill.** It
+returns `(indices, IndexerState)` where the state holds the compressed pools, the raw-K
+tail ring and the token count. Before it did, decode re-pooled from the single new
+token and used *local* positions, so **a decode token attended to 1 of 21 positions —
+itself alone** — while every prefill test passed. On device those three regions live in
+the latent page (`cache_layout.py`); `forward_core` takes them explicitly so the decode
+path is testable without the cache.
 
 Same outer contract. Per dev3's `MLA-DECODE-GAP.md`:
 
@@ -172,7 +199,9 @@ instrument**. Both capture mechanisms in `accuracy/tensor_capture.py` are used:
 | `layers.{i}.mla.latent` | the single cache tensor, before it is consumed as both K and V |
 | `layers.{i}.mla.attn_pre_oproj` | attention output before `o_proj` folds heads together |
 
-`Glm5NextSparseMLA.forward` will also accept an optional `topk_indices` override, so
+`Glm5NextSparseMLA.**forward_core**` accepts an optional `topk_indices` override —
+**not `forward`**, so it is unreachable from the serving path and cannot be left on by
+accident (there is a test asserting it is absent from `forward`'s signature). It lets
 attention can be checked **given the device's own selection**. That is the only way to
 separate "selected the right tokens" from "attended to them correctly", and the same
 hook on the oracle's `SparseMLAttention` isolated a 0.5% attention bug that was
@@ -194,7 +223,33 @@ otherwise buried inside selection divergence.
   no visible connection to the converter. Use `weight_converter.converted_config()`,
   which drops it at every level and asserts none survived.
 
-## 7. Order of work
+## 7. Two rules that cost real defects here
+
+**Any component with carried state needs a prefill-then-decode-equals-one-shot-prefill
+test before it can be called validated.** Not "remember to check" — apply it
+mechanically. Both the KDA conv window and the MLA indexer shipped broken decode paths
+with every prefill test passing.
+
+**Any two components that hand state to each other need a composition test, not two
+independent ones.** Layer-to-layer, prefill-to-decode, kernel-to-kernel. The two NKI
+kernels were each validated against the oracle and their *handoff* was untested; it
+turned out sound, but a transposed `[K, V]` state would have passed every shape
+assertion we have — `128 x 128` is square — and is visible only numerically, at 20.3%.
+
+### The kernels' input contracts are asymmetric, and only one half bites
+
+| input | `kda_cte` | `kda_tkg` | uniform caller? |
+|---|---|---|---|
+| `q`, `k` | already l2-normed | RAW | **harmless** — l2norm is idempotent to 5e-7 |
+| `beta` | POST-sigmoid | RAW, pre-sigmoid | **WRONG** — ~5% on the output |
+| `gate` | per-channel log | same | fine |
+
+A contract asymmetry is only dangerous where the operation is **non-idempotent**. The
+`q`/`k` one looks like the obvious hazard and is not; `beta` is, because double-sigmoid
+*compresses the range* (0.48–0.70 into 0.62–0.67) rather than producing an obvious
+error. Both are asserted in `sim/simulate_kernels.py::run_chain`.
+
+## 8. Order of work
 
 1. This document, and any corrections from dev1/dev3.
 2. `kda.py` against the oracle's `LinearAttention`, torch fallback first, then kernels.
