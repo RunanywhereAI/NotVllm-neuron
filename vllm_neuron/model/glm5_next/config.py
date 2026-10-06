@@ -193,6 +193,16 @@ class Glm5NextTextConfig:
             )
         )
 
+    def state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        """``(conv_state, recurrent_state)`` dtypes for one KDA layer.
+
+        The conv window holds activations and follows the model dtype; the recurrent
+        state accumulates over the whole sequence and is kept in float32 so the delta
+        rule does not drift. The registered class reports these to vLLM and the model
+        reports them to the runner, from this one place.
+        """
+        return (self.torch_dtype, torch.float32)
+
     @classmethod
     def from_hf(cls, text_cfg: PretrainedConfig) -> Glm5NextTextConfig:
         layer_types = tuple(getattr(text_cfg, "layer_types"))
