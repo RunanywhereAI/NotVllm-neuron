@@ -143,9 +143,13 @@ class ForgetGate(nn.Module):
     consumer below broadcasts the decay over K rather than over heads.
     """
 
-    def __init__(self, p: KDAParams):
+    def __init__(self, p: KDAParams, num_heads: int):
+        """``num_heads`` is THIS RANK's head count, and required: ``p.num_heads`` is the
+        global count, and under TP the gate must match the rank's q/k/v heads. It used to
+        read ``p.num_heads`` -- right at TP=1, silently wrong (and a shape error at best)
+        at any other degree."""
         super().__init__()
-        H, K, D = p.num_heads, p.head_dim, p.hidden_size
+        H, K, D = num_heads, p.head_dim, p.hidden_size
         self.H, self.K = H, K
         self.f_a_proj = nn.Linear(D, K, bias=False)
         self.f_b_proj = nn.Linear(K, H * K, bias=False)
@@ -284,7 +288,7 @@ class Glm5NextKDA(nn.Module):
         # The checkpoint stores three depthwise conv1ds; they concatenate channel-wise.
         self.conv1d = nn.Conv1d(3 * self.HK, 3 * self.HK, p.conv_kernel,
                                 groups=3 * self.HK, bias=False, padding=p.conv_kernel - 1)
-        self.forget_gate = ForgetGate(p)
+        self.forget_gate = ForgetGate(p, self.H)
         self.b_proj = nn.Linear(D, self.H, bias=False)
         self.g_a_proj = nn.Linear(D, self.K, bias=False)
         self.g_b_proj = nn.Linear(self.K, self.HK, bias=False)
