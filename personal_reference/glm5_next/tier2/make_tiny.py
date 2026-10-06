@@ -61,6 +61,12 @@ def main(out: pathlib.Path, real_config: pathlib.Path | None) -> None:
     tiny["linear_attn_config"] = lac
     cfg["text_config"] = tiny
     cfg["tie_word_embeddings"] = False
+    # The vision tower is never built by the plugin (text-only), but transformers builds
+    # it, and check_transformers.py loads this checkpoint through transformers. Shrink
+    # it; its weights are absent, which transformers reports and the text path ignores.
+    cfg["vision_config"].update(depth=1, hidden_size=32, intermediate_size=64, num_heads=2,
+                                out_hidden_size=text_ns.hidden_size,
+                                projection_intermediate_size=64)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
 
     # the oracle, at the plugin config's values
