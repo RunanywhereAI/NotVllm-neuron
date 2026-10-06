@@ -251,6 +251,7 @@ class NeuronPlatform(Platform):
             vllm_config.cache_config.mamba_page_size_padded,
         )
         super()._align_hybrid_block_size(vllm_config, _BlockAlignmentOnlyBackend)
+        cls._pad_recurrent_page_to_folded_latent_page(vllm_config)
         after = (
             vllm_config.cache_config.block_size,
             vllm_config.cache_config.mamba_page_size_padded,
@@ -264,6 +265,53 @@ class NeuronPlatform(Platform):
                 before[1],
                 after[1],
             )
+
+    @classmethod
+    def _pad_recurrent_page_to_folded_latent_page(cls, vllm_config: "VllmConfig") -> None:
+        """Make the recurrent page match an MLA page that carries more than its latent.
+
+        vLLM's ``_align_hybrid_block_size`` takes its ``use_mla`` branch for
+        GLM-5.3-Flash (``mla_detect_patch`` makes ``use_mla`` True), so it sizes the
+        attention page as ``MLAAttentionSpec(block_size=1, ...)`` -- the latent only,
+        ``kv_lora_rank`` elements per token with no V half -- grows the block size until
+        that covers the recurrent state, and pads the recurrent page to it. But the
+        model folds the DSA indexer's pool keys and tail ring into the same page
+        (``model/glm5_next/cache_layout.py``, option (c) of GLM53-FLASH-FRAMEWORK-GAP §4),
+        so its real page is larger than the one vLLM matched, and the planner would
+        refuse the two unequal page sizes.
+
+        So ask the registered class for the folded page at the block size vLLM chose,
+        the same way vLLM asks it for the recurrent state shapes, and pad the recurrent
+        page up to that. The model reports the identical number to the runner through
+        its ``LatentLayerSpec``; both come from ``cache_layout.latent_page_bytes``.
+        Growing the recurrent page is always possible -- the folded page is at least the
+        latent page, which vLLM already made at least the recurrent page -- and it is
+        only padding: the runner's page-major view never reads past the real state.
+        """
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            model_config.architecture, model_config=model_config
+        )
+        page_fn = getattr(model_cls, "get_latent_page_bytes_from_config", None)
+        if page_fn is None:
+            return
+        folded = page_fn(vllm_config, cache_config.block_size)
+        recurrent = MambaSpec(
+            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+            block_size=-1,
+        ).page_size_bytes
+        if folded < recurrent:
+            raise ValueError(
+                f"folded MLA page {folded} B is smaller than the recurrent state page "
+                f"{recurrent} B at block_size={cache_config.block_size}; the hybrid "
+                f"alignment should have grown the block size first"
+            )
+        cache_config.mamba_page_size_padded = folded
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
