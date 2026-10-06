@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -8558,6 +8559,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
 
+            # MLA latent cache. **This test must precede the Full/SlidingWindow
+            # one**: MLAAttentionSpec SUBCLASSES FullAttentionSpec, so it would
+            # otherwise pass that isinstance check and then die on the
+            # ``.view((2, num_blocks, ...))`` below with exactly twice the elements
+            # it has -- the latent page holds no V half, which is why
+            # MLAAttentionSpec.real_page_size_bytes drops the factor of 2.
+            #
+            # One tensor per layer, not a [k, v] pair. A single latent serves as both
+            # K and V: measured bit-identical on the read path
+            # (MLA-DECODE-GAP.md §2.5), and at ``tp_k_prior=True`` the two have
+            # identical shapes anyway. The page also carries this layer's indexer and
+            # tail regions -- see model/glm5_next/cache_layout.py, which owns the
+            # offsets. The runner deliberately does not know them: it allocates whole
+            # pages and the model slices.
+            if isinstance(kv_cache_spec, MLAAttentionSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_size = kv_cache_spec.page_size_bytes
+                    assert raw_tensor.numel() % page_size == 0
+                    num_pages = raw_tensor.numel() // page_size
+                    elem = get_dtype_size(kv_cache_spec.dtype)
+                    if page_size % elem:
+                        raise NotImplementedError(
+                            f"latent page of {page_size} bytes is not a whole "
+                            f"number of {elem}-byte elements; the model slices one "
+                            f"typed view of the page and Neuron rejects strided "
+                            f"in-place writes on bound tensors"
+                        )
+                    pages = _shared_dtype_view(raw_tensor, kv_cache_spec.dtype).view(
+                        num_pages, page_size // elem
+                    )
+                    kv_caches[layer_name] = [pages]
+                    self._kv_cache_full_tensors[layer_name] = pages
+                continue
+
             # This is the case that all layers have the same kv_hidden_size.
             if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                 for layer_name in group.layer_names:
@@ -8854,6 +8890,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     self.vllm_config.cache_config.mamba_page_size_padded
                 ),
                 mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+            )
+
+        # MLA layers. ``MLAAttentionSpec`` is what vLLM's own
+        # ``_align_hybrid_block_size`` builds when ``model_config.use_mla`` is True, so
+        # emitting it here keeps our page arithmetic and the upstream sizing helper
+        # agreeing rather than one working around the other. ``num_kv_heads=1`` is MLA's
+        # decode shape (it is MQA over the latent), and ``head_size`` is the latent
+        # width, which for a NoPE model is ``kv_lora_rank`` with no rope half.
+        #
+        # ``page_size_padded`` carries the folded indexer and tail regions. The layer
+        # reports the total from ``LatentPageLayout``; this function does not recompute
+        # it, because a second derivation of that arithmetic aliases memory instead of
+        # raising.
+        for lat_layer in getattr(target_kv_spec, "latent_layers", ()):
+            all_kv_cache_specs[lat_layer.name] = MLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=lat_layer.kv_lora_rank,
+                dtype=lat_layer.dtype,
+                page_size_padded=lat_layer.page_bytes,
             )
 
         if self.speculative_config and self.speculative_config.use_eagle():

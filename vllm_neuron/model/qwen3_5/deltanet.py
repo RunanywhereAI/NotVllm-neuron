@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import os
 import torch
+
+from ..kv_cache import state_page_indices
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.distributed.parallel_state import get_tp_group
@@ -734,39 +736,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-request read and write page for the batch, as ``(read, write)``.
 
-        The recurrent group's ``mamba_block_size`` equals ``max_model_len``, so
-        every sequence owns exactly one block and its state slot is simply that
-        block's id.
-
-        Padded batch rows need two different redirects, which is why this returns
-        a pair. They must *read* zeros: their output is discarded but their
-        logits are not, and the sampler's argmax reduces across the whole tile,
-        so a dead row that reads another group's bytes as float32 state hands its
-        NaN logits to every live row in the batch. And they must *write*
-        somewhere else, since writing the zero page is what would stop it being
-        zeros. The runner reserves one page for each, past ``num_blocks``.
+        Delegates to ``model.kv_cache.state_page_indices``, which is the canonical
+        implementation shared with every other recurrent-state model. It was lifted out
+        of here rather than copied: it carries the PAD_SLOT_ID -> NULL_BLOCK_ID sentinel
+        change, an out-of-bound-DMA bound check, and the padded-row read/write split
+        whose failure mode is NaN logits spreading across a whole batch tile. Two copies
+        of that would drift apart without announcing it.
         """
-        block_table = metadata["block_table_tensor"]
-        indices = block_table[:num_reqs, 0].to(torch.long)
-        slot_mapping = metadata["slot_mapping"].view(num_reqs, -1)[:, 0]
-        sink = self.state_pages.shape[0] - 1
-        zero_page = sink - 1
-        # ``> 0``, not ``>= 0``: the runner's padding sentinel changed from
-        # PAD_SLOT_ID (-1) on 0.21 to NULL_BLOCK_ID (0) on 0.24, and 0 is vLLM's
-        # reserved null block, so no live token ever maps there. Bound-check the
-        # id too -- a padded batch row's block_table entry is simply stale from
-        # an earlier step, and on device an out-of-range index is an out-of-bound
-        # indirect DMA rather than a wrapped one.
-        live = (slot_mapping > 0) & (indices > 0) & (indices < zero_page)
-        return torch.where(
-            live,
-            indices,
-            torch.full_like(indices, zero_page),
-        ), torch.where(
-            live,
-            indices,
-            torch.full_like(indices, sink),
-        )
+        return state_page_indices(metadata, num_reqs, self.state_pages.shape[0])
 
     # ── Shared pieces ────────────────────────────────────────────────────
 
