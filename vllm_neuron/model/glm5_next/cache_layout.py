@@ -123,7 +123,7 @@ class LatentPageLayout:
             kv_lora_rank=config.kv_lora_rank,
             index_head_dim=config.index_head_dim,
             index_kpool=config.index_kpool,
-            element_size=torch.tensor([], dtype=dtype).element_size(),
+            element_size=dtype.itemsize,   # no tensor: this runs inside a traced forward
         )
 
     def __post_init__(self) -> None:
