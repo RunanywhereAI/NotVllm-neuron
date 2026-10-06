@@ -5,6 +5,17 @@ by dev2, 2026-09-25. Branch `glm5next-attention`. **Implemented**: `kda.py` and 
 oracle (28 tests). The framework seams — state indices, the latent page layout — are
 still open and marked in the code.
 
+> **Status on branch `glm5next`, 2026-10-06.** Both seams are closed. `Glm5NextKDA.forward`
+> binds to its state page through `kv_cache.state_page_indices`; `Glm5NextSparseMLA.forward`
+> reads and writes the folded page only through `cache_layout.LatentPageLayout` and writes
+> through `functional/vendored_kernels/latent_cache_write` (a one-buffer row scatter from PR
+> #40). `model.py` composes them with mHC and the MoE, and the whole model matches the oracle
+> on prefill and on prefill-then-decode at batch > 1 over hostile pages
+> (`personal_reference/glm5_next/tests/test_plugin_model.py`). Two changes to what is
+> described below: the indexer's pool keys are stored at the **page dtype**, not vLLM's FP8
+> format (nothing in the plugin or the oracle scores FP8); and `KDAParams`/`MLAParams` no
+> longer default any field. The NKI KDA kernels are still not dispatched from the layers.
+
 Read §5 first if you only read one part: the capture design is the thing that is hard
 to retrofit and easy to omit.
 
