@@ -35,10 +35,23 @@ expert with a zero routing weight for the unselected ones. Exact, static-shaped 
 compilable at a tiny config; hopeless at 288 experts. The device path is the NKI MoE
 kernels (``NF.moe_cte`` / ``NF.moe_block_tkg``, as ``gpt_oss/model_bf16.py``), not wired.
 
-Tensor parallelism: the layers size themselves per rank and every row-parallel output
-passes through ``Glm5NextDecoderLayer._reduce``, but the weight loaders below are
-written for TP=1 only and ``Glm5NextForCausalLM`` refuses anything else. Sharding is
-unvalidated, and a wrong shard is silent.
+Tensor parallelism (``_attach_weight_loaders`` is the one table of what is sharded):
+
+* KDA: q/k/v/b/g_b/f_b projections, ``dt_bias`` and ``A_log`` by head (rows), the three
+  depthwise convs by head and re-concatenated per rank, ``o_proj`` by input column;
+  ``f_a``/``g_a`` (the low-rank A halves) and ``o_norm`` replicated.
+* MLA: ``q_b_proj`` and ``kv_b_proj`` by head (each head's rows are contiguous),
+  ``o_proj`` by column; ``q_a``/``kv_a`` (the shared latent) and the whole DSA indexer
+  replicated, so every rank selects identically and holds the full latent cache.
+* MLPs and experts: tensor-parallel inside every expert -- gate and up rows, down
+  columns -- because 288 experts do not divide over 64 ranks (EP would need a hybrid
+  layout; a perf item). The router is replicated; routing weights scale partial expert
+  outputs, which is exact because the sum over ranks is linear.
+* Embedding vocab-sharded and all-reduced, LM head vocab-sharded (``nn``'s
+  ``VocabDimShardedEmbedding`` / ``ColumnParallelLinear``), everything else replicated.
+
+Every row-parallel output is all-reduced once, in ``Glm5NextDecoderLayer._reduce``:
+after the mixer and after the (routed + shared) MLP.
 """
 
 from __future__ import annotations
@@ -50,6 +63,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm_neuron.model.kv_cache import KVSpec, LatentLayerSpec, RecurrentLayerSpec
+from vllm_neuron.nn.cpl import ColumnParallelLinear
+from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
 from .cache_layout import latent_page_bytes
 from .kda import Glm5NextKDA
@@ -273,18 +288,21 @@ class Glm5NextDecoderLayer(nn.Module):
 class Glm5NextTextModel(nn.Module):
     """Embedding -> ``hc_mult`` copies -> 45 layers -> unweighted stream mean -> norm."""
 
-    def __init__(self, config, tp_size: int = 1, reduce=None):
+    def __init__(self, config, tp_size: int = 1, reduce=None, tp_device_group=None):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabDimShardedEmbedding(config.vocab_size, config.hidden_size,
+                                                     tp_group=tp_device_group)
+        if self.embed_tokens.tp_size != tp_size:
+            raise ValueError(f"embedding sees TP={self.embed_tokens.tp_size}, model TP={tp_size}")
         self.layers = nn.ModuleList(
             Glm5NextDecoderLayer(config, i, tp_size=tp_size, reduce=reduce)
             for i in range(config.num_hidden_layers)
         )
         self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids, positions, attn_metadata):
-        h = self.embed_tokens(input_ids)
+    def forward(self, input_ids, positions, attn_metadata, rank=None):
+        h = self.embed_tokens(input_ids, scatter_tokens=False, rank=rank)
         streams = h.unsqueeze(-2).expand(*h.shape[:-1], self.config.hc_mult, h.shape[-1])
         streams = streams.contiguous()
         for layer in self.layers:
@@ -309,34 +327,44 @@ class Glm5NextForCausalLM(nn.Module):
     kv_cache_page_major = True
 
     def __init__(self, config, tp_group=None):
+        """``tp_group``: vLLM's ``GroupCoordinator`` for the TP group (``world_size``,
+        ``rank_in_group``, ``all_reduce`` returning its result, ``all_gather``,
+        ``device_group``), or anything with that surface; ``None`` means TP=1."""
         super().__init__()
         text = config.text_config
         self.config, self.text_config = config, text
         self.tp_group = tp_group
         self.world_size = 1 if tp_group is None else tp_group.world_size
-        if self.world_size != 1:
-            raise NotImplementedError(
-                f"GLM-5.3-Flash at TP={self.world_size}: the layers size themselves per "
-                f"rank, but the weight loaders here shard nothing and no TP>1 run has "
-                f"been validated. A wrong shard loads without complaint."
-            )
-        self.model = Glm5NextTextModel(text, tp_size=self.world_size, reduce=self._all_reduce)
-        self.lm_head = nn.Linear(text.hidden_size, text.vocab_size, bias=False)
+        self.rank = 0 if tp_group is None else tp_group.rank_in_group
+        device_group = None if tp_group is None else tp_group.device_group
+        for name, n in (("linear num_heads", text.linear_num_heads),
+                        ("num_attention_heads", text.num_attention_heads),
+                        ("intermediate_size", text.intermediate_size),
+                        ("moe_intermediate_size", text.moe_intermediate_size),
+                        ("vocab_size", text.vocab_size)):
+            if n % self.world_size:
+                raise ValueError(f"{name}={n} does not divide over TP={self.world_size}")
 
         nc = getattr(config, "neuron_config", None)
         self.on_device_sampling_config = (
             getattr(nc, "on_device_sampling_config", None) if nc is not None else None
         )
+        self.model = Glm5NextTextModel(text, tp_size=self.world_size, reduce=self._all_reduce,
+                                       tp_device_group=device_group)
+        self.lm_head = ColumnParallelLinear(
+            text.hidden_size, text.vocab_size, bias=False,
+            gather_output=self.on_device_sampling_config is None, tp_group=device_group)
+        if self.lm_head.tp_size != self.world_size:
+            raise ValueError(f"lm_head sees TP={self.lm_head.tp_size}, model TP={self.world_size}")
+        self._attach_weight_loaders()
+
         self._gather_logits = nc is not None and (
             getattr(nc, "max_logprobs", 0) != 0 or getattr(nc, "debug_logits_dir", None) is not None
         )
         if self.on_device_sampling_config is not None:
             from vllm_neuron.nn.sampler import Sampler
 
-            self.sampler = Sampler(
-                self.on_device_sampling_config,
-                process_group=None if tp_group is None else tp_group.device_group,
-            )
+            self.sampler = Sampler(self.on_device_sampling_config, process_group=device_group)
 
     def _all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
@@ -422,13 +450,16 @@ class Glm5NextForCausalLM(nn.Module):
         if spec_decode_metadata is not None:
             raise NotImplementedError("speculative decoding (MTP) is out of scope")
         positions = positions.to(torch.int32)
-        hidden = self.model(input_ids, positions, attn_metadata)
+        hidden = self.model(input_ids, positions, attn_metadata, rank=rank)
         if sampling_positions is not None:
             hidden = torch.index_select(hidden, 0, sampling_positions)
         logits = self.compute_logits(hidden)
         if self.on_device_sampling_config is None:
             return logits
-        gathered = logits if self._gather_logits else None
+        gathered = None
+        if self._gather_logits:
+            gathered = (self.tp_group.all_gather(logits, dim=1) if self.world_size > 1
+                        else logits)
         # No NaN guard here, deliberately (Qwen3.5 explains why it does not compile);
         # dead rows are kept finite at their source instead -- the zero page.
         sampled = self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank)
@@ -442,8 +473,7 @@ class Glm5NextForCausalLM(nn.Module):
         from .config import Glm5NextConfig
 
         config = Glm5NextConfig.from_configs(hf_config, text_neuron_config=text_neuron_config)
-        tp = get_tp_group()
-        model = cls(config, tp_group=tp if tp.world_size > 1 else None)
+        model = cls(config, tp_group=get_tp_group())
         return model.set_dtype(config.text_config.torch_dtype)
 
     def checkpoint_mappings(self) -> dict[str, object]:
@@ -509,34 +539,72 @@ class Glm5NextForCausalLM(nn.Module):
         return m
 
     def _attach_weight_loaders(self) -> None:
-        """The three regroupings, as loaders on the parameters that need them."""
-        from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
+        """Which parameters are sharded, and how -- set on the modules themselves, not by
+        matching names, so a renamed parameter cannot fall through to "replicated".
 
-        cat0 = SafetensorsWeightLoader(transform=lambda s, _r: torch.cat([x[:] for x in s], 0))
+        Every loader runs at every TP degree (at TP=1 a shard is the whole tensor), so
+        the TP=1 oracle comparison exercises the same code that shards at TP=64. A
+        parameter left out of this table loads replicated; if its shape is per-rank
+        that is a shape error at ``load_state_dict``, not a silent mistake.
+        """
+        from vllm_neuron.utils.weight_loader import (
+            SafetensorsWeightLoader,
+            get_shard,
+            set_weight_loader,
+        )
 
-        def _gate_up(slices, _rank):
-            pairs = [torch.cat([slices[2 * e][:], slices[2 * e + 1][:]], 0)
-                     for e in range(len(slices) // 2)]
-            return torch.stack(pairs)
+        n = self.world_size
 
-        stack = SafetensorsWeightLoader(transform=lambda s, _r: torch.stack([x[:] for x in s]))
-        for name, param in self.named_parameters():
-            if name.endswith("self_attn.conv1d.weight"):
-                set_weight_loader(param, cat0)
-            elif name.endswith("mlp.gate_up_proj"):
-                set_weight_loader(param, SafetensorsWeightLoader(transform=_gate_up))
-            elif name.endswith("mlp.down_proj"):
-                set_weight_loader(param, stack)
+        def shard(t, dim, rank):
+            size = t.get_shape()[dim]
+            if size % n:
+                raise ValueError(f"dim {dim} of size {size} does not divide over TP={n}")
+            return get_shard(t, dim, size // n, n, rank)
+
+        def by(dim):
+            return SafetensorsWeightLoader(transform=lambda s, r: shard(s[0], dim, r))
+
+        rows, cols = by(0), by(1)
+        # q, k, v depthwise convs: shard each by head, then concatenate per rank
+        conv = SafetensorsWeightLoader(
+            transform=lambda s, r: torch.cat([shard(x, 0, r) for x in s], 0))
+        # [gate_0, up_0, gate_1, up_1, ...]: shard gate and up rows inside every expert
+        gate_up = SafetensorsWeightLoader(transform=lambda s, r: torch.stack([
+            torch.cat([shard(s[2 * e], 0, r), shard(s[2 * e + 1], 0, r)], 0)
+            for e in range(len(s) // 2)]))
+        down = SafetensorsWeightLoader(
+            transform=lambda s, r: torch.stack([shard(x, 1, r) for x in s]))
+
+        for layer in self.model.layers:
+            a = layer.self_attn
+            if layer.is_linear_attention:
+                for lin in (a.q_proj, a.k_proj, a.v_proj, a.b_proj, a.g_b_proj,
+                            a.forget_gate.f_b_proj):
+                    set_weight_loader(lin.weight, rows)
+                set_weight_loader(a.forget_gate.dt_bias, rows)
+                set_weight_loader(a.forget_gate.A_log, rows)
+                set_weight_loader(a.conv1d.weight, conv)
+                set_weight_loader(a.o_proj.weight, cols)
+            else:
+                set_weight_loader(a.q_b_proj.weight, rows)
+                set_weight_loader(a.kv_b_proj.weight, rows)
+                set_weight_loader(a.o_proj.weight, cols)
+            mlp = layer.mlp
+            if isinstance(mlp, Glm5NextMoE):
+                set_weight_loader(mlp.gate_up_proj, gate_up)
+                set_weight_loader(mlp.down_proj, down)
+                mlp = mlp.shared_experts
+            set_weight_loader(mlp.gate_proj.weight, rows)
+            set_weight_loader(mlp.up_proj.weight, rows)
+            set_weight_loader(mlp.down_proj.weight, cols)
 
     def load_weights(self, checkpoint_path: str, device: torch.device,
                      cache_dir: str | None = None) -> None:
         from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 
-        self._attach_weight_loaders()
         mappings = self.checkpoint_mappings()
-        rank = 0 if self.tp_group is None else self.tp_group.rank_in_group
         loaded = SafetensorsCheckpoint(checkpoint_path, cache_dir).load_sharded_pipelined(
-            rank, self.world_size, self, mappings, device, strict=False,
+            self.rank, self.world_size, self, mappings, device, strict=False,
         ).state_dict
         # strict=False is forced on us (the loader does not know about buffers), which
         # means a parameter with a wrong mapping keeps its uninitialised value and the
