@@ -23,9 +23,12 @@ approximated. Every constant below was cross-referenced against transformers
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
-from transformers import PretrainedConfig
+
+if TYPE_CHECKING:  # annotations only: the CPU oracle comparison imports this module
+    from transformers import PretrainedConfig  # on hosts without transformers
 
 # <-- MODEL-SPECIFIC: the two entries HF uses in text_config.layer_types.
 LINEAR_ATTENTION = "linear_attention"
@@ -42,6 +45,43 @@ def _dtype_of(cfg: PretrainedConfig, default: torch.dtype) -> torch.dtype:
     if isinstance(raw, torch.dtype):
         return raw
     return getattr(torch, str(raw).replace("torch.", ""))
+
+
+# checkpoint ``linear_attn_config`` key -> transformers' flattened attribute
+_LINEAR_KEYS = {
+    "num_heads": "linear_num_heads",
+    "head_dim": "linear_head_dim",
+    "short_conv_kernel_size": "linear_conv_kernel_dim",
+    "gate_lower_bound": "linear_lower_bound",
+}
+
+
+def _linear_attn_fields(text_cfg) -> dict:
+    """The four KDA geometry values, from whichever form the config object carries.
+
+    ``config.json`` nests them in ``linear_attn_config``; transformers 5.17's
+    ``Glm5NextTextConfig.__post_init__`` copies that dict onto flat ``linear_*``
+    attributes, and whether the dict itself survives on the object is transformers'
+    business, not ours. Accept either, require every value, and refuse a config whose
+    two forms disagree -- no defaults, because a defaulted kernel width or gate bound
+    that happens to equal the real one is indistinguishable from a wired one.
+    """
+    lac = getattr(text_cfg, "linear_attn_config", None)
+    out = {}
+    for key, flat in _LINEAR_KEYS.items():
+        nested = lac.get(key) if isinstance(lac, dict) else None
+        attr = getattr(text_cfg, flat, None)
+        if nested is not None and attr is not None and nested != attr:
+            raise ValueError(
+                f"linear_attn_config[{key!r}]={nested!r} disagrees with {flat}={attr!r}"
+            )
+        value = nested if nested is not None else attr
+        if value is None:
+            raise ValueError(
+                f"GLM-5.3-Flash config has neither linear_attn_config[{key!r}] nor {flat}"
+            )
+        out[key] = value
+    return out
 
 
 @dataclass
@@ -214,6 +254,27 @@ class Glm5NextTextConfig:
         if scoring != "sigmoid":
             raise NotImplementedError(f"scoring_func={scoring!r} is not implemented.")
 
+        # Behaviour the model hardcodes because the released checkpoint fixes it. Each
+        # is read with the released value as its default only so that a config which
+        # omits the key still loads; a config that says otherwise is refused.
+        if not getattr(text_cfg, "index_kpool_compress", True):
+            raise NotImplementedError(
+                "index_kpool_compress=False is not implemented; the indexer only "
+                "scores kpool-compressed pools."
+            )
+        if not getattr(text_cfg, "index_kpool_always_select_tail", True):
+            raise NotImplementedError(
+                "index_kpool_always_select_tail=False is not implemented."
+            )
+        if getattr(text_cfg, "hidden_act", "silu") != "silu":
+            raise NotImplementedError(
+                f"hidden_act={text_cfg.hidden_act!r}; the clamped SwiGLU and the KDA "
+                f"conv activation are silu."
+            )
+        topk_method = getattr(text_cfg, "topk_method", "noaux_tc")
+        if topk_method != "noaux_tc":
+            raise NotImplementedError(f"topk_method={topk_method!r} is not implemented.")
+
         indexer_types = tuple(getattr(text_cfg, "indexer_types", ()) or ())
         if indexer_types and set(indexer_types) != {"full"}:
             raise NotImplementedError(
@@ -222,9 +283,7 @@ class Glm5NextTextConfig:
                 f"propagate selections between layers."
             )
 
-        lac = getattr(text_cfg, "linear_attn_config", None)
-        if not isinstance(lac, dict):
-            raise ValueError("GLM-5.3-Flash config is missing linear_attn_config")
+        linear = _linear_attn_fields(text_cfg)
 
         return cls(
             hidden_size=text_cfg.hidden_size,
@@ -242,10 +301,10 @@ class Glm5NextTextConfig:
             index_head_dim=text_cfg.index_head_dim,
             index_topk=text_cfg.index_topk,
             index_kpool=text_cfg.index_kpool,
-            linear_num_heads=lac["num_heads"],
-            linear_head_dim=lac["head_dim"],
-            linear_conv_kernel_dim=lac["short_conv_kernel_size"],
-            linear_lower_bound=lac["gate_lower_bound"],
+            linear_num_heads=linear["num_heads"],
+            linear_head_dim=linear["head_dim"],
+            linear_conv_kernel_dim=linear["short_conv_kernel_size"],
+            linear_lower_bound=linear["gate_lower_bound"],
             hc_mult=text_cfg.hc_mult,
             hc_sinkhorn_iters=text_cfg.hc_sinkhorn_iters,
             hc_eps=text_cfg.hc_eps,
