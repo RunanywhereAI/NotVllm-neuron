@@ -347,3 +347,9 @@ class LatentPageLayout:
         bring up at 128K first.
         """
         return max_model_len * self.latent_bytes_per_token * num_mla_layers
+
+
+def latent_page_bytes(config, dtype: torch.dtype, block_size: int) -> int:
+    """Bytes of one folded MLA page -- the number both the runner's spec and the
+    platform's page alignment use, so neither can compute it differently."""
+    return LatentPageLayout.from_config(config, block_size, dtype).total_bytes
