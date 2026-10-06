@@ -3,7 +3,10 @@
 
 Run anywhere with torch + safetensors (no vLLM, no transformers):
 
-    python personal_reference/glm5_next/tier2/make_tiny.py OUT_DIR [REAL_CONFIG_JSON]
+    python personal_reference/glm5_next/tier2/make_tiny.py OUT_DIR [REAL_CONFIG_JSON] [OVERRIDES_JSON]
+
+``OVERRIDES_JSON`` replaces text_config keys of ``plugin_harness.TINY_HF`` -- e.g. 4 KDA
+and 4 MLA heads, so the checkpoint divides over TP=4.
 
 ``config.json`` is the released config (``zai-org/GLM-5.3-Flash-BF16``, found in the HF
 cache if not given) with ``text_config`` shrunk to ``plugin_harness.TINY_HF`` and
@@ -35,7 +38,9 @@ NEW_TOKENS = 16
 SEED = 0
 
 
-def main(out: pathlib.Path, real_config: pathlib.Path | None) -> None:
+def main(out: pathlib.Path, real_config: pathlib.Path | None = None,
+         overrides: dict | None = None) -> None:
+    overrides = overrides or {}
     out.mkdir(parents=True, exist_ok=True)
     if real_config is None:
         real_config = sorted(pathlib.Path.home().glob(
@@ -43,7 +48,7 @@ def main(out: pathlib.Path, real_config: pathlib.Path | None) -> None:
     cfg = json.loads(pathlib.Path(real_config).read_text())
     assert "quantization_config" not in cfg and "quantization_config" not in cfg["text_config"]
 
-    text_ns = H.hf_text_config(dtype=torch.float32)
+    text_ns = H.hf_text_config(dtype=torch.float32, **overrides)
     n = text_ns.num_hidden_layers
     tiny = dict(cfg["text_config"])
     for k, v in vars(text_ns).items():
@@ -71,7 +76,7 @@ def main(out: pathlib.Path, real_config: pathlib.Path | None) -> None:
 
     # the oracle, at the plugin config's values
     CFG = H.import_plugin("vllm_neuron.model.glm5_next.config")
-    text = CFG.Glm5NextTextConfig.from_hf(H.hf_text_config(dtype=torch.float32))
+    text = CFG.Glm5NextTextConfig.from_hf(H.hf_text_config(dtype=torch.float32, **overrides))
     oracle = R.FlashTextModel(H.oracle_cfg(text, R), vocab=text.vocab_size).eval()
     H.randomize_(oracle, seed=SEED)
     # float32 on disk: the reference below runs these exact weights, unrounded
@@ -101,4 +106,6 @@ def main(out: pathlib.Path, real_config: pathlib.Path | None) -> None:
 
 
 if __name__ == "__main__":
-    main(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None)
+    main(pathlib.Path(sys.argv[1]),
+         pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None,
+         json.loads(sys.argv[3]) if len(sys.argv) > 3 else None)

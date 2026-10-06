@@ -38,7 +38,7 @@ def main(ckpt: str) -> int:
     model = M.Glm5NextForCausalLM(CFG.Glm5NextConfig(text_config=text)).eval()
     model.load_weights(ckpt, torch.device("cpu"))
     ref = json.loads((pathlib.Path(ckpt) / "oracle_reference.json").read_text())
-    run = H.FakeRunner(model, 32, num_blocks=64)
+    run = H.FakeRunner(model, H.aligned_block_size(model), num_blocks=64)
     seqs = [list(p["prompt"]) for p in ref["prompts"]]
     lps = [[] for _ in seqs]
     with torch.no_grad():
