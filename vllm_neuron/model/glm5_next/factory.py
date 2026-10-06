@@ -5,9 +5,8 @@ This class exists so vLLM's **front end** can see and accept the model:
 ``ModelConfig`` validation happens before any worker is created, so the
 architecture has to be registered and its hybrid contract satisfied there.
 
-Scope note: the decoder itself (KDA layers, sparse-MLA, the DSA indexer) is not
-here. ``from_configs`` raises until that lands. Everything below is the part vLLM
-asks about *before* it would ever call ``forward``.
+The decoder itself is ``model.py``; ``from_configs`` builds it. Everything else here is
+what vLLM asks about *before* it would ever call ``forward``.
 
 The ``IsHybrid`` contract, and why we must satisfy it ourselves
 --------------------------------------------------------------
@@ -27,18 +26,19 @@ later and further away.
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import torch
 import torch.nn as nn
-from transformers import PretrainedConfig
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 from .config import Glm5NextConfig
 
-_NOT_YET = (
-    "GLM-5.3-Flash decoder is not implemented yet. This class provides only the "
-    "vLLM front-end contract: architecture registration, the IsHybrid protocol "
-    "and the KDA state geometry. The KDA and sparse-MLA layers land separately."
+_FRONT_END_ONLY = (
+    "Glm5NextForConditionalGeneration is the front-end registration; the runner builds "
+    "the decoder through from_configs, which returns a model.Glm5NextForCausalLM."
 )
 
 
@@ -53,8 +53,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     (``_check_vllm_model_init``), an ``embed_input_ids`` and a ``forward``;
     ``VllmModelForTextGeneration`` adds ``compute_logits``. Miss any one and
     ``ModelConfig`` validation fails with "This model does not support
-    ``--runner generate``" long before anything else here is reached. All of them
-    raise when called; only their presence is inspected.
+    ``--runner generate``" long before anything else here is reached. On this class
+    all of them raise when called; only their presence is inspected. The working ones
+    are on ``model.Glm5NextForCausalLM``, which ``from_configs`` returns.
     """
 
     # vLLM's IsHybrid protocol. Declared explicitly: nothing upstream declares it
@@ -93,8 +94,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
         recurrent state accumulates over the whole sequence and is kept in
         float32 so the delta rule does not drift.
         """
+        return cls._text_config(vllm_config).state_dtypes()
+
+    @classmethod
+    def get_latent_page_bytes_from_config(cls, vllm_config, block_size: int) -> int:
+        """Bytes of one folded MLA page (latent + indexer pools + tail ring) at
+        ``block_size``.
+
+        The platform's hybrid page alignment calls this through the registered class,
+        exactly as vLLM calls ``get_mamba_state_shape_from_config``, and pads the
+        recurrent page up to it; the model reports the same number to the runner. Both
+        go through ``cache_layout.latent_page_bytes``, so the two cannot disagree.
+        """
+        from .cache_layout import latent_page_bytes
+
         text = cls._text_config(vllm_config)
-        return (text.torch_dtype, torch.float32)
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype != "auto":
+            raise NotImplementedError(
+                f"kv cache dtype {cache_dtype!r}: the folded MLA page is laid out at "
+                f"the model dtype; a quantized latent cache is not implemented"
+            )
+        return latent_page_bytes(text, vllm_config.model_config.dtype, block_size)
 
     def __init__(self, vllm_config=None, prefix: str = "") -> None:
         """Signature matters: vLLM's ``VllmModel`` protocol checks for a
@@ -104,13 +125,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.prefix = prefix
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError(_NOT_YET)
+        raise NotImplementedError(_FRONT_END_ONLY)
 
     def forward(self, *args, **kwargs):
-        raise NotImplementedError(_NOT_YET)
+        raise NotImplementedError(_FRONT_END_ONLY)
 
     def compute_logits(self, *args, **kwargs):
-        raise NotImplementedError(_NOT_YET)
+        raise NotImplementedError(_FRONT_END_ONLY)
 
     @classmethod
     def from_configs(
@@ -119,7 +140,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_neuron_config: object | None = None,
         **kwargs: object,
     ):
-        raise NotImplementedError(_NOT_YET)
+        """Text-only: a ``vision_neuron_config`` is ignored and the vision tower is never
+        built (serve with ``limit_mm_per_prompt={"image": 0, "video": 0}``)."""
+        from .model import Glm5NextForCausalLM
+
+        return Glm5NextForCausalLM.from_configs(hf_config, text_neuron_config)
 
 
 __all__ = ["Glm5NextForConditionalGeneration"]
