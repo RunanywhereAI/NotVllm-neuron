@@ -8577,6 +8577,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size = kv_cache_spec.page_size_bytes
+                    # Page ``b`` of this view must be exactly the bytes vLLM reserved
+                    # for block ``b`` in every layer sharing the buffer. A latent page
+                    # smaller than the shared page would stride through the other
+                    # groups' pages -- silent corruption, so refuse it.
+                    if page_major and page_size != page_bytes:
+                        raise NotImplementedError(
+                            f"latent page {page_size} B differs from the shared page "
+                            f"{page_bytes} B; the platform's hybrid alignment should "
+                            f"have padded the recurrent page to the folded MLA page"
+                        )
                     assert raw_tensor.numel() % page_size == 0
                     num_pages = raw_tensor.numel() // page_size
                     elem = get_dtype_size(kv_cache_spec.dtype)
@@ -8904,12 +8914,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # it, because a second derivation of that arithmetic aliases memory instead of
         # raising.
         for lat_layer in getattr(target_kv_spec, "latent_layers", ()):
+            # The model sizes its page from the layout at its own dtype; the planner
+            # allocates at the cache dtype. A mismatch would size one and view the
+            # other, so refuse it here rather than read a page at the wrong width.
+            if lat_layer.dtype != kv_cache_dtype:
+                raise NotImplementedError(
+                    f"latent layer {lat_layer.name!r} is laid out for "
+                    f"{lat_layer.dtype} but the KV cache dtype is {kv_cache_dtype}; "
+                    f"a quantized latent cache is not implemented"
+                )
             all_kv_cache_specs[lat_layer.name] = MLAAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=lat_layer.kv_lora_rank,
                 dtype=lat_layer.dtype,
-                page_size_padded=lat_layer.page_bytes,
+                page_size_padded=lat_layer.page_bytes_for(block_size),
             )
 
         if self.speculative_config and self.speculative_config.use_eagle():

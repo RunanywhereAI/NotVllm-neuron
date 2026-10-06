@@ -128,3 +128,20 @@ def test_the_characterisation_test_can_fail():
     assert not torch.equal(got_r, wrong_r), (
         "comparison is insensitive to num_pages, so it would not catch a drift in it"
     )
+
+
+def test_paged_block_ids_sends_every_unusable_entry_to_the_zero_page():
+    """The decode gather's redirect. Live entries pass; a dead row, the null block, a
+    stale id at or past the reserved pages, and a negative sentinel all read zeros."""
+    num_pages = 10                       # 8 real blocks + zero page 8 + sink 9
+    zero_page, sink = KC.reserved_pages(num_pages)
+    assert (zero_page, sink) == (8, 9)
+    bt = torch.tensor([[3, 5, 0, -1], [7, 8, 9, 12], [2, 4, 6, 1]], dtype=torch.int32)
+    live = torch.tensor([True, True, False])
+    got = KC.paged_block_ids(bt, live, num_pages)
+    want = torch.tensor([[3, 5, 8, 8], [7, 8, 8, 8], [8, 8, 8, 8]])
+    assert torch.equal(got, want)
+    # and it must agree with state_page_indices about which page is the zero page
+    meta = _meta([3, 4], [96, 0])
+    read, write = KC.state_page_indices(meta, 2, num_pages)
+    assert read[1].item() == zero_page and write[1].item() == sink

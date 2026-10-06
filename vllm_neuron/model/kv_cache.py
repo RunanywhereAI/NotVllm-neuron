@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
@@ -71,14 +72,19 @@ class LatentLayerSpec:
         name: Layer name, matching the key vLLM uses for its cache tensor.
         kv_lora_rank: Latent width per token.
         dtype: Element type of the page.
-        page_bytes: Total bytes this layer needs per block, from
-            ``LatentPageLayout.total_bytes`` -- latent plus indexer plus tail.
+        page_bytes_for: ``block_size -> bytes`` for one page, i.e.
+            ``LatentPageLayout.total_bytes`` -- latent plus indexer plus tail. A
+            function rather than a number because the block size is resolved by the
+            platform's hybrid alignment, which the model never sees; the runner calls
+            this with the block size it is about to allocate with, and the platform
+            calls the same layout code through the registered class, so the two cannot
+            disagree.
     """
 
     name: str
     kv_lora_rank: int
     dtype: torch.dtype
-    page_bytes: int
+    page_bytes_for: Callable[[int], int]
 
 
 @dataclass
@@ -93,6 +99,39 @@ class KVSpec:
     layers: list[LayerSpec]
     recurrent_layers: list[RecurrentLayerSpec] = field(default_factory=list)
     latent_layers: list[LatentLayerSpec] = field(default_factory=list)
+
+
+def reserved_pages(num_pages: int) -> tuple[int, int]:
+    """``(zero_page, sink)``: the two private pages the runner appends past ``num_blocks``
+    under ``kv_cache_page_major``.
+
+    Dead rows READ the zero page -- nothing ever writes it, so it still holds the zeros
+    the allocation put there -- and WRITE the sink. vLLM knows about neither.
+    """
+    sink = num_pages - 1
+    return sink - 1, sink
+
+
+def paged_block_ids(
+    block_table: torch.Tensor, live_rows: torch.Tensor, num_pages: int
+) -> torch.Tensor:
+    """A decode batch's block table with every unusable entry sent to the zero page.
+
+    Padded batch rows, and the unused tail of a live row's table, carry stale ids or
+    the null block (0); on device an out-of-range id is an out-of-bound indirect DMA,
+    and a recycled id hands back another group's bytes. Gathering the zero page instead
+    keeps every gathered byte finite, which the caller still has to *select* away (not
+    multiply away -- ``NaN * 0`` is NaN) for positions past the sequence.
+
+    Args:
+        block_table: ``[num_reqs, max_blocks]``.
+        live_rows: ``[num_reqs]`` bool.
+        num_pages: First dimension of the bound pages, reserved pages included.
+    """
+    zero_page, _ = reserved_pages(num_pages)
+    bt = block_table.to(torch.long)
+    ok = live_rows.view(-1, 1) & (bt > 0) & (bt < zero_page)
+    return torch.where(ok, bt, torch.full_like(bt, zero_page))
 
 
 def state_page_indices(
@@ -125,8 +164,7 @@ def state_page_indices(
     block_table = metadata["block_table_tensor"]
     indices = block_table[:num_reqs, 0].to(torch.long)
     slot_mapping = metadata["slot_mapping"].view(num_reqs, -1)[:, 0]
-    sink = num_pages - 1
-    zero_page = sink - 1
+    zero_page, sink = reserved_pages(num_pages)
     # ``> 0``, not ``>= 0``: the runner's padding sentinel changed from PAD_SLOT_ID (-1)
     # on 0.21 to NULL_BLOCK_ID (0) on 0.24, and 0 is vLLM's reserved null block, so no
     # live token ever maps there. Bound-check the id too -- a padded batch row's
