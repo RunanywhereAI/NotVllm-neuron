@@ -22,6 +22,7 @@ Two pieces, both torch-only:
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import math
 import pathlib
@@ -149,8 +150,7 @@ def randomize_(model, seed=0, mlp_gain=6.0):
 
 
 def plugin_state_from_oracle(oracle_sd):
-    return {("lm_head.weight" if k == "lm_head.weight" else f"model.{k}"): v
-            for k, v in oracle_sd.items()}
+    return import_plugin("vllm_neuron.model.glm5_next.model").state_dict_from_reference(oracle_sd)
 
 
 # ------------------------------------------------------------------ the fake runner
@@ -380,12 +380,35 @@ SABOTAGE = {
     # parameter -> loaded from the NEXT rank's slice on rank 1 (wrong shard, right shape)
     "kda_conv": "model.layers.0.self_attn.conv1d.weight",
     "mla_kv_b": "model.layers.3.self_attn.kv_b_proj.weight",
-    "expert_gate_up": "model.layers.7.mlp.gate_up_proj",
     "kda_A_log": "model.layers.5.self_attn.forget_gate.A_log",
+    # routed experts take their shard from the expert layout, not the loader's rank, so
+    # these rebuild the loaders from a layout with one coordinate wrong
+    "expert_gate_up": "model.layers.7.mlp.gate_up_proj",
+    "expert_down": "model.layers.4.mlp.down_proj",
 }
+_EXPERT_SABOTAGE = {"expert_gate_up": 0, "expert_down": 1}     # which of the two loaders
 
 
-def tp_worker(rank, world, port, ckpt, out_path, sabotage):
+def expert_layout_for(rank, world, ep_degree, M):
+    """Contiguous EP x TP placement for the laptop harness: expert group ``rank // tp``,
+    intermediate shard ``rank % tp``. (On trn2 the plugin's mesh decides; see
+    ``ExpertLayout``.)"""
+    if ep_degree == 1:
+        return None
+    tp = world // ep_degree
+    return M.ExpertLayout(ep_degree=ep_degree, ep_rank=rank // tp, tp_degree=tp,
+                          tp_rank=rank % tp)
+
+
+def _wrong(layout, world, M):
+    """The same layout with the coordinate that varies across ranks moved by one."""
+    L = layout or M.ExpertLayout(tp_degree=world, tp_rank=0)
+    if L.tp_degree > 1:
+        return dataclasses.replace(L, tp_rank=(L.tp_rank + 1) % L.tp_degree)
+    return dataclasses.replace(L, ep_rank=(L.ep_rank + 1) % L.ep_degree)
+
+
+def tp_worker(rank, world, port, ckpt, out_path, sabotage, ep_degree=1):
     """One TP rank: load this rank's shards from ``ckpt``, then run every prompt of
     ``oracle_reference.json`` through ``FakeRunner`` -- one prefill per request, then
     batched decode with a padded row -- teacher-forced on the oracle's greedy tokens so
@@ -405,13 +428,21 @@ def tp_worker(rank, world, port, ckpt, out_path, sabotage):
         tc = json.loads((pathlib.Path(ckpt) / "config.json").read_text())["text_config"]
         tc["dtype"] = torch.float32
         text = CFG.Glm5NextTextConfig.from_hf(SimpleNamespace(**tc))
+        layout = expert_layout_for(rank, world, ep_degree, M)
         model = M.Glm5NextForCausalLM(CFG.Glm5NextConfig(text_config=text),
-                                      tp_group=GlooTP(world, rank)).eval()
+                                      tp_group=GlooTP(world, rank),
+                                      expert_layout=layout).eval()
         if sabotage and rank == 1:
             param = dict(model.named_parameters())[SABOTAGE[sabotage]]
-            inner = WL.get_weight_loader(param)
-            WL.set_weight_loader(param, WL.SafetensorsWeightLoader(
-                transform=lambda s, r: inner.transform(s, (r + 1) % world)))
+            if sabotage in _EXPERT_SABOTAGE:
+                if layout is None:
+                    layout = M.ExpertLayout(tp_degree=world, tp_rank=rank)
+                bad = model.expert_loaders(_wrong(layout, world, M))[_EXPERT_SABOTAGE[sabotage]]
+                WL.set_weight_loader(param, bad)
+            else:
+                inner = WL.get_weight_loader(param)
+                WL.set_weight_loader(param, WL.SafetensorsWeightLoader(
+                    transform=lambda s, r: inner.transform(s, (r + 1) % world)))
         model.load_weights(ckpt, torch.device("cpu"))
         ref = json.loads((pathlib.Path(ckpt) / "oracle_reference.json").read_text())
         run = FakeRunner(model, aligned_block_size(model), num_blocks=64)
@@ -431,7 +462,7 @@ def tp_worker(rank, world, port, ckpt, out_path, sabotage):
         dist.destroy_process_group()
 
 
-def run_tp(world: int, ckpt, out_path, sabotage=None):
+def run_tp(world: int, ckpt, out_path, sabotage=None, ep_degree=1):
     import socket
 
     import torch.multiprocessing as mp
@@ -439,6 +470,6 @@ def run_tp(world: int, ckpt, out_path, sabotage=None):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    mp.spawn(tp_worker, args=(world, port, str(ckpt), str(out_path), sabotage),
+    mp.spawn(tp_worker, args=(world, port, str(ckpt), str(out_path), sabotage, ep_degree),
              nprocs=world, join=True)
     return torch.load(out_path)
