@@ -63,10 +63,11 @@ def ckpts(tmp_path_factory):
 _CACHE: dict = {}
 
 
-def _run(world, ckpt, tmp_path, sabotage=None):
-    key = (world, str(ckpt), sabotage)
+def _run(world, ckpt, tmp_path, sabotage=None, ep=1):
+    key = (world, str(ckpt), sabotage, ep)
     if key not in _CACHE:
-        _CACHE[key] = H.run_tp(world, ckpt, tmp_path / f"tp{world}_{sabotage}.pt", sabotage)
+        _CACHE[key] = H.run_tp(world, ckpt, tmp_path / f"tp{world}_ep{ep}_{sabotage}.pt",
+                               sabotage, ep_degree=ep)
     return _CACHE[key]
 
 
@@ -116,3 +117,24 @@ def test_a_wrong_shard_is_caught(ckpts, tmp_path, sabotage):
     print(f"\n  {sabotage}: TP=2 with one wrong shard, max rel {err:.2e}")
     assert err > 1e-3, f"a wrong {sabotage} shard went unnoticed"
     assert all(torch.isfinite(t).all() for t in got["decode"])
+
+
+@pytest.mark.parametrize("ep", [2, 4])
+def test_expert_parallel_matches_tp1(ckpts, tmp_path, ep):
+    """TP world 4 with the routed experts split EP x TP = ep x 4/ep -- the layout the
+    NKI MoE kernels need at TP=64 (``I_TP >= 128``). Attention, the shared expert and
+    the dense MLPs stay tensor-parallel over all 4 ranks."""
+    base = _run(1, ckpts[4], tmp_path)
+    got = _run(4, ckpts[4], tmp_path, ep=ep)
+    err = _max_rel(got, base)
+    print(f"\n  EP={ep} x TP={4 // ep} vs TP=1: max rel {err:.2e}")
+    assert err < 1e-4
+
+
+def test_a_wrong_expert_group_is_caught(ckpts, tmp_path):
+    """At EP=4 x TP=1, rank 1 loads the NEXT expert group's experts."""
+    base = _run(1, ckpts[4], tmp_path)
+    got = _run(4, ckpts[4], tmp_path, sabotage="expert_gate_up", ep=4)
+    err = _max_rel(got, base)
+    print(f"\n  EP=4, one rank holding the wrong experts: max rel {err:.2e}")
+    assert err > 1e-3
