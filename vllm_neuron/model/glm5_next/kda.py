@@ -376,6 +376,9 @@ class Glm5NextKDA(nn.Module):
         q, k, v = (t.reshape(B, S, self.H, self.K)
                    for t in qkv.transpose(1, 2).split([self.HK] * 3, -1))
         core, rec_state = recurrent_step(q, k, v, g, beta, rec_state)
+        # ``recurrent_step`` computes in fp32 and returns fp32; ``chunk_prefill`` casts
+        # back to the input dtype. Do the same here, or a bf16 ``o_proj`` refuses it.
+        core = core.to(qkv.dtype)
         self._capture("recurrent_state", rec_state)
         return self._finish(core, gate, B, S), (conv_state, rec_state)
 
