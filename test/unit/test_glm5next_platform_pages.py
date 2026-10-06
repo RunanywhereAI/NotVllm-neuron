@@ -92,7 +92,7 @@ def _specs(vc, text, n_kda: int, n_mla: int, dtype):
 @needs_config
 def test_real_config_at_tp64_aligns_to_one_page(hf_config):
     vc, text = _vllm_config(hf_config, tp=64, dtype=torch.bfloat16)
-    NeuronPlatform._align_hybrid_page_sizes(vc)
+    NeuronPlatform.update_block_size_for_backend(vc)     # the real entry: 32, then align
     cc = vc.cache_config
     specs, lay = _specs(vc, text, n_kda=34, n_mla=11, dtype=torch.bfloat16)
     print(f"\n  block_size {cc.block_size}; {lay.describe()}; "
@@ -115,6 +115,7 @@ def test_without_the_padding_step_vllm_refuses_the_model(hf_config):
     """Non-vacuity: vLLM's alignment alone matches the recurrent page to the LATENT
     page, and the folded page is bigger, so the planner cannot unify them."""
     vc, text = _vllm_config(hf_config, tp=64, dtype=torch.bfloat16)
+    vc.cache_config.block_size = 32
     super(NeuronPlatform, NeuronPlatform)._align_hybrid_block_size(vc, _alignment_backend())
     specs, lay = _specs(vc, text, n_kda=34, n_mla=11, dtype=torch.bfloat16)
     assert vc.cache_config.mamba_page_size_padded == 96 * 1024 != lay.total_bytes
