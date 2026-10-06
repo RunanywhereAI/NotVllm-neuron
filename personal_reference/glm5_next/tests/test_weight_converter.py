@@ -388,3 +388,42 @@ def test_plan_against_real_index():
     assert len(p.simple) == 1144 and len(p.targets) == 1262
     assert len(p.conv) == 34
     assert len(p.expert_gate_up) == len(p.expert_down) == 42
+
+
+# ------------------------------------------- the converted config must drop fp8
+# Dequantizing the tensors is not enough. vLLM's ModelConfig refuses a checkpoint
+# that still advertises fp8 ("fp8 quantization is currently not supported in cpu")
+# before any plugin code runs, so the failure surfaces in the front end with no
+# visible connection to this converter. Found by dev1 during front-end bring-up.
+
+def _write_cfg(tmp_path, cfg):
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    return tmp_path
+
+
+def test_converted_config_drops_quantization_at_every_level(tmp_path):
+    """GLM nests most config under text_config, so a top-level pop is not enough."""
+    src = {"model_type": "glm5_next",
+           "quantization_config": {"quant_method": "fp8"},
+           "text_config": {"hidden_size": 4096,
+                           "quantization_config": {"quant_method": "fp8"}}}
+    got = WC.converted_config(_write_cfg(tmp_path, src))
+    assert "quantization_config" not in got
+    assert "quantization_config" not in got["text_config"]
+    assert got["text_config"]["hidden_size"] == 4096, "the rest must survive"
+
+
+def test_converted_config_is_a_noop_on_an_unquantized_checkpoint(tmp_path):
+    """The BF16 repo has no quantization_config; converting it must still work."""
+    src = {"model_type": "glm5_next", "text_config": {"hidden_size": 4096}}
+    assert WC.converted_config(_write_cfg(tmp_path, src)) == src
+
+
+def test_a_surviving_quantization_config_is_rejected_loudly():
+    """DISCRIMINATING. Copying the original config.json is the mistake this catches,
+    and the assertion names the front-end error so the connection is findable."""
+    for cfg in ({"quantization_config": {"quant_method": "fp8"}},
+                {"text_config": {"quantization_config": {"quant_method": "fp8"}}}):
+        with pytest.raises(ConversionError, match="refuse the checkpoint"):
+            WC.assert_no_quantization_config(cfg)
+    WC.assert_no_quantization_config({"text_config": {"hidden_size": 4096}})

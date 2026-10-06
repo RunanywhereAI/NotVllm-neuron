@@ -136,7 +136,10 @@ def kda_cte(
     Args:
         q, k, v (nl.NkiTensor): ``[B, S, D]``. ``S`` must be a multiple of 64.
             ``q``/``k`` arrive **already l2-normed** (caller's job, as in gdn_cte).
-        beta (nl.NkiTensor): ``[B, S]`` per-token update strength (post-sigmoid).
+        beta (nl.NkiTensor): ``[B, S]`` per-token update strength (**post-sigmoid**).
+            Note ``kda_tkg`` takes ``b`` **pre-sigmoid**, so a caller feeding both
+            kernels the same tensor is wrong for one of them. See that kernel's
+            ``state_in`` note; the q/k convention also differs but is harmless.
         gate (nl.NkiTensor): ``[B, S, D]`` **PER-CHANNEL** log-decay, negative.
             This is the KDA difference; GDN takes ``[B, S]``.
         scale (float): query scaling, typically ``1/sqrt(D)``.

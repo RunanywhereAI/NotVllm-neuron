@@ -11,8 +11,8 @@ machine. Both are fixed here.
 |---|---|---|
 | `reference.py` | the CPU oracle: KDA, mHC, the DSA indexer, sparse-MLA, MoE | anywhere with torch |
 | `weight_converter.py` | FP8 checkpoint → the oracle's `state_dict` | anywhere with torch |
-| `nki_kda_tkg.py` | KDA **decode** kernel | needs NKI |
-| `nki_kda_cte.py` | KDA **chunked-prefill** kernel | needs NKI |
+| `../../vllm_neuron/model/glm5_next/nki_kda_tkg.py` | KDA **decode** kernel | needs NKI |
+| `../../vllm_neuron/model/glm5_next/nki_kda_cte.py` | KDA **chunked-prefill** kernel | needs NKI |
 | `tests/` | ~260 tests, torch only | anywhere with torch |
 | `sim/simulate_kernels.py` | acceptance harness for both kernels | needs NKI |
 
@@ -69,8 +69,24 @@ Three things that will otherwise cost time:
   which needs the source checkout on `PYTHONPATH`.
 - **The API is `nki.simulate`, not `nki.simulate_kernel`.**
 
-The harness only needs this package's files, not the whole repo, so copying
-`glm5_next/` to the box is enough.
+The kernels live in the **plugin** (`vllm_neuron/model/glm5_next/`) because they are
+production code, while this directory is reference material. The harness loads them
+**by file path**, not as `vllm_neuron.model.glm5_next.*` — importing them as a package
+would execute `vllm_neuron/__init__.py` and pull in vLLM, and the harness must run on a
+box that has the Neuron toolchain but not necessarily vLLM.
+(`vllm_neuron/model/glm5_next/__init__.py` is deliberately empty for the same reason.)
+
+So copy **two** directories, preserving their relative layout:
+
+```
+<anywhere>/personal_reference/glm5_next/
+<anywhere>/vllm_neuron/model/glm5_next/
+```
+
+or set `GLM5NEXT_KERNELS=<dir holding nki_kda_*.py>` for any other arrangement. A
+missing kernel is a clear error with a non-zero exit, not an import traceback.
+Verified end-to-end from a copied tree, including that both failure modes — missing
+kernel and a failing check — exit non-zero.
 
 ## What is validated, and what is not
 

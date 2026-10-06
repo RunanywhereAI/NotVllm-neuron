@@ -4,6 +4,11 @@
 Maps ``zai-org/GLM-5.3-Flash`` (76,108 tensors, 328.3 GB, FP8 e4m3 block-scaled)
 onto ``reference.py``'s module names, dequantizing FP8 to BF16 on the way.
 
+**A converted checkpoint needs ``converted_config()`` as well as the tensors.**
+Dequantizing alone leaves ``quantization_config`` in ``config.json``, and vLLM then
+refuses the checkpoint in its front end, before any plugin code runs. See that
+function.
+
 Design decisions worth knowing before changing anything here:
 
 **Nothing is passed through silently.** Every tensor name is matched against an
@@ -289,6 +294,53 @@ def dequant_block_fp8(w, scale_inv, block: int = BLOCK):
     s = scale_inv.to(torch.float32)
     s = s.repeat_interleave(block, -2)[..., :r, :].repeat_interleave(block, -1)[..., :c]
     return (wf * s).to(torch.bfloat16)
+
+
+QUANT_KEY = "quantization_config"
+
+
+def converted_config(hf_dir: str | Path) -> dict:
+    """The checkpoint's ``config.json`` with ``quantization_config`` **removed**.
+
+    Dequantizing the tensors is not enough: a BF16 checkpoint that still *advertises*
+    fp8 is unloadable. vLLM's ``ModelConfig`` refuses it before any plugin code runs,
+    with ``"fp8 quantization is currently not supported in cpu"`` — a front-end error
+    with no visible connection to this converter, which is exactly why it is worth a
+    function rather than a sentence in a docstring.
+
+    So a converted checkpoint directory needs BOTH this config and
+    ``build_state_dict``'s tensors. Writing the tensors and copying the original
+    config produces something that looks converted and cannot be loaded.
+
+    (Found by dev1 during front-end bring-up, 2026-09-25. It also independently
+    justifies the BF16-first decision: the plugin has no blockwise-FP8 weight path,
+    and the front end would not have accepted the checkpoint even if it did.)
+    """
+    cfg = json.loads((Path(hf_dir) / "config.json").read_text())
+    cfg.pop(QUANT_KEY, None)
+    for sub in ("text_config", "vision_config"):
+        if isinstance(cfg.get(sub), dict):
+            cfg[sub].pop(QUANT_KEY, None)
+    assert_no_quantization_config(cfg)
+    return cfg
+
+
+def assert_no_quantization_config(cfg: dict) -> None:
+    """Raise if any level of ``cfg`` still advertises quantization.
+
+    Checked at both levels because GLM-5.3-Flash nests most of its model config under
+    ``text_config``, so a top-level-only pop leaves a live key behind.
+    """
+    bad = [k for k, v in (("", cfg), ("text_config.", cfg.get("text_config")),
+                          ("vision_config.", cfg.get("vision_config")))
+           if isinstance(v, dict) and QUANT_KEY in v for k in (k,)]
+    if bad:
+        raise ConversionError(
+            f"config still advertises quantization at: {[b + QUANT_KEY for b in bad]}. "
+            f"vLLM's ModelConfig will refuse the checkpoint before the plugin loads "
+            f"('fp8 quantization is currently not supported in cpu'). Use "
+            f"converted_config() rather than copying the original config.json."
+        )
 
 
 def build_state_dict(hf_dir: str | Path, plan: Plan | None = None) -> dict:

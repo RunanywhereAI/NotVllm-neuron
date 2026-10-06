@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Acceptance harness for both KDA NKI kernels under ``nki.simulate``.
 
-    python3 simulate_kernels.py [tkg|cte|all]
+    python3 simulate_kernels.py [tkg|cte|chain|all]
 
 **Needs the NKI toolchain, so it does NOT run on a laptop** -- see ``../README.md``
 for the box invocation. Exits non-zero on failure, so it is usable as a gate rather
 than only a printout. This replaces five ad-hoc scripts that lived only in ``~/kda/``
 on one machine: the two kernels that took the most work to get right were validated
 by code nobody else could reach.
+
+The kernels themselves live in ``vllm_neuron/model/glm5_next/`` (they are production
+code); this harness loads them **by path** so that neither it nor they require vLLM.
 
 What it checks, and why each one is here rather than being a nice-to-have:
 
@@ -56,8 +59,46 @@ import nki.language as nl  # noqa: E402
 import neuron_dtypes as dt  # noqa: E402
 
 from glm5_next import reference as R  # noqa: E402
-from glm5_next.nki_kda_tkg import kda_tkg, RMS_NORM_EPS  # noqa: E402
-from glm5_next.nki_kda_cte import kda_cte  # noqa: E402
+
+
+def _load_kernels():
+    """Load the kernels BY PATH, not as ``vllm_neuron.model.glm5_next.*``.
+
+    The kernels live in the plugin (production code); the oracle lives here
+    (reference material). Importing them as a package would execute
+    ``vllm_neuron/__init__.py``, which pulls in vLLM — and this harness must run on a
+    box that has the Neuron toolchain but not necessarily vLLM. Loading by path keeps
+    that property; ``vllm_neuron/model/glm5_next/__init__.py`` is deliberately empty
+    for the same reason.
+
+    Override with ``GLM5NEXT_KERNELS=<dir>`` if the tree is laid out differently, e.g.
+    when only part of the repo has been copied to a machine.
+    """
+    import importlib.util
+    import os
+
+    env = os.environ.get("GLM5NEXT_KERNELS")
+    cand = (pathlib.Path(env) if env
+            else _HERE.parents[3] / "vllm_neuron" / "model" / "glm5_next")
+    mods = {}
+    for name in ("nki_kda_tkg", "nki_kda_cte"):
+        f = cand / f"{name}.py"
+        if not f.is_file():
+            raise SystemExit(
+                f"kernel not found: {f}\n"
+                f"Copy the repo subtree, or set GLM5NEXT_KERNELS to the directory "
+                f"holding nki_kda_tkg.py and nki_kda_cte.py."
+            )
+        spec = importlib.util.spec_from_file_location(name, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        mods[name] = m
+    return mods
+
+
+_K = _load_kernels()
+kda_tkg, RMS_NORM_EPS = _K["nki_kda_tkg"].kda_tkg, _K["nki_kda_tkg"].RMS_NORM_EPS
+kda_cte = _K["nki_kda_cte"].kda_cte
 
 K = V = 128
 FAILURES: list[str] = []
@@ -165,11 +206,98 @@ def run_cte():
     check("still correct under a genuinely scalar gate", rel_sc < 0.015, f"{rel_sc:.3%}")
 
 
+# ------------------------------------------------------- the handoff between them
+# Each kernel is checked against the oracle INDEPENDENTLY above. That leaves the
+# composition untested, and a real serving path is prefill-then-decode: cte writes a
+# final state, tkg consumes it as its initial state. If those layouts or semantics
+# disagree, every check above still passes and the model produces garbage from the
+# second token on.
+#
+# THE TWO KERNELS DO NOT SHARE AN INPUT CONTRACT, which is the trap a caller falls
+# into by treating them uniformly:
+#
+#   | input | kda_cte        | kda_tkg            |
+#   |-------|----------------|--------------------|
+#   | input | kda_cte           | kda_tkg                | uniform caller?      |
+#   | q, k  | ALREADY l2-normed | RAW (normed in-kernel) | harmless — idempotent |
+#   | beta  | POST-sigmoid      | RAW, pre-sigmoid       | **WRONG** — 20% shift |
+#   | gate  | per-channel log   | same                   | fine                  |
+#
+# Only beta bites. l2norm(l2norm(x)) == l2norm(x) to 5e-7, but sigmoid(sigmoid(b))
+# compresses 0.48-0.70 into 0.62-0.67, so beta quietly loses its dynamic range.
+#
+# The state itself is [BH, D, D] fp32 from both, so it hands over directly.
+
+def run_chain():
+    print("\nhandoff: kda_cte state -> kda_tkg")
+    BH, S = 2, 64
+    r = lambda *sh, o=0: _rand(*sh, seed=100 + o)
+    q, k, v = r(BH, S + 1, K, o=0), r(BH, S + 1, K, o=1), r(BH, S + 1, V, o=2)
+    b_raw = r(BH, S + 1, o=3)                       # RAW; cte wants sigmoid, tkg does not
+    gate = -5.0 * torch.sigmoid(r(BH, S + 1, K, o=4))
+    z, nw = r(BH, V, o=5), 1.0 + 0.2 * r(V, o=6)
+
+    # prefill the first S tokens, each kernel fed ITS OWN contract
+    cte_out, cte_state = _cte_run(R.l2norm(q[:, :S]), R.l2norm(k[:, :S]), v[:, :S],
+                                  torch.sigmoid(b_raw[:, :S]), gate[:, :S])
+    # decode token S using cte's state, with RAW q/k and RAW b
+    tkg_out, tkg_state = _tkg_run(q[:, S], k[:, S], v[:, S], b_raw[:, S], gate[:, S],
+                                  z, nw, cte_state)
+
+    # oracle: chunk over S, then one recurrent step, then the gated norm
+    o_chunk, o_state = R.chunk_kda(q[:, :S, None], k[:, :S, None], v[:, :S, None],
+                                   gate[:, :S, None], torch.sigmoid(b_raw[:, :S, None]),
+                                   torch.zeros(BH, 1, K, V), chunk=64)
+    core, o_state2 = R.recurrent_kda(q[:, S:S + 1, None], k[:, S:S + 1, None],
+                                     v[:, S:S + 1, None], gate[:, S:S + 1, None],
+                                     torch.sigmoid(b_raw[:, S:S + 1, None]), o_state)
+    n = R.RMSNormGated(V, RMS_NORM_EPS)
+    with torch.no_grad():
+        n.weight.copy_(nw)
+        o_out = n(core[:, 0, 0], z)
+
+    ds = (cte_state - o_state[:, 0]).abs().max().item() / o_state.abs().max().item()
+    check("cte state matches the oracle's chunk state", ds < 0.02, f"{ds:.3%}")
+    d2 = (tkg_state - o_state2[:, 0]).abs().max().item() / o_state2.abs().max().item()
+    check("tkg state after consuming cte's", d2 < 0.02, f"{d2:.3%}")
+    do = (tkg_out - o_out).abs().max().item() / o_out.abs().max().item()
+    check("chained output matches the oracle", do < 0.02, f"{do:.3%}")
+
+    # non-vacuity: a corrupted handoff must be visible. Transposing [K,V] is the
+    # layout error this check exists to catch, and it is symmetric-shaped so a shape
+    # check alone would not see it.
+    bad_out, _ = _tkg_run(q[:, S], k[:, S], v[:, S], b_raw[:, S], gate[:, S], z, nw,
+                          cte_state.transpose(-1, -2).contiguous())
+    shift = (bad_out - tkg_out).abs().max().item() / tkg_out.abs().max().item()
+    check("a transposed state handoff is caught", shift > 0.05, f"{shift:.1%} shift")
+
+    # The two contract asymmetries are NOT equally dangerous, which is the useful
+    # half of this check and the opposite of what I first asserted.
+    #
+    #   q/k: l2norm is IDEMPOTENT (double-norming differs by 5e-7), so a caller that
+    #        uniformly l2-norms both kernels' inputs is fine.
+    #   beta: sigmoid is NOT. Double-sigmoid shifts 19.6% and compresses the range
+    #        from 0.48-0.70 to 0.62-0.67, so beta silently loses its dynamic range.
+    #
+    # So the trap is beta alone. Both are asserted, in the directions they actually go.
+    pre_out, _ = _tkg_run(R.l2norm(q[:, S]), R.l2norm(k[:, S]), v[:, S], b_raw[:, S],
+                          gate[:, S], z, nw, cte_state)
+    d3 = (pre_out - tkg_out).abs().max().item() / tkg_out.abs().max().item()
+    check("pre-normed q/k is harmless (l2norm is idempotent)", d3 < 0.02, f"{d3:.1%} shift")
+    sig_out, _ = _tkg_run(q[:, S], k[:, S], v[:, S], torch.sigmoid(b_raw[:, S]),
+                          gate[:, S], z, nw, cte_state)
+    d4 = (sig_out - tkg_out).abs().max().item() / tkg_out.abs().max().item()
+    check("but pre-sigmoided beta is NOT (sigmoid is not idempotent)", d4 > 0.02,
+          f"{d4:.1%} shift")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("tkg", "all"):
         run_tkg()
     if which in ("cte", "all"):
         run_cte()
+    if which in ("chain", "all"):
+        run_chain()
     print(f"\n{'FAILED: ' + ', '.join(FAILURES) if FAILURES else 'all checks passed'}")
     sys.exit(1 if FAILURES else 0)
