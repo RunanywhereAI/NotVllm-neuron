@@ -286,7 +286,8 @@ class FakeRunner:
 
 
 # ------------------------------------------------------------ a checkpoint on disk
-def hf_checkpoint_from_oracle(oracle_sd: dict, n_experts: int) -> dict:
+def hf_checkpoint_from_oracle(oracle_sd: dict, n_experts: int,
+                              dtype: torch.dtype = torch.bfloat16) -> dict:
     """The oracle's state_dict in the checkpoint's own names and layout: the inverse of
     ``weight_converter.py`` (q/k/v convs split, the forget gate flattened, experts
     unstacked). BF16 like ``zai-org/GLM-5.3-Flash-BF16``, except the router bias, which
@@ -316,7 +317,7 @@ def hf_checkpoint_from_oracle(oracle_sd: dict, n_experts: int) -> dict:
                 out[f"{base}experts.{e}.down_proj.weight"] = v[e].contiguous()
         else:
             out[P + k2] = v
-    return {k: (v.float() if k.endswith("e_score_correction_bias") else v.to(torch.bfloat16))
+    return {k: (v.float() if k.endswith("e_score_correction_bias") else v.to(dtype))
             for k, v in out.items()}
 
 
