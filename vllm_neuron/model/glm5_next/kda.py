@@ -41,6 +41,13 @@ import torch.nn.functional as F
 from torch import nn
 
 try:
+    from vllm_neuron.model.kv_cache import state_page_indices
+except ImportError:  # pragma: no cover - loaded by path on a host without vLLM
+    # ``forward`` (the framework path) needs it; ``forward_prefill``/``forward_decode``
+    # do not, and those are what the by-path oracle comparison exercises.
+    state_page_indices = None
+
+try:
     from vllm_neuron.accuracy.tensor_capture import capture_tensor as _capture_tensor
 except ImportError:  # pragma: no cover - exercised on hosts without vLLM
     # ``tensor_capture`` itself needs only the stdlib, but importing it through the
@@ -61,25 +68,46 @@ class KDAParams:
     do. Values are the live ``zai-org/GLM-5.3-Flash`` ``linear_attn_config``.
     """
 
-    num_heads: int = 64
-    head_dim: int = 128
-    conv_kernel: int = 4
-    gate_lower_bound: float = -5.0
-    hidden_size: int = 4096
-    rms_norm_eps: float = 1e-5
+    num_heads: int
+    head_dim: int
+    conv_kernel: int
+    gate_lower_bound: float
+    hidden_size: int
+    rms_norm_eps: float
+
+    # checkpoint ``linear_attn_config`` key -> ``Glm5NextTextConfig`` field
+    _FLAT = {
+        "num_heads": "linear_num_heads",
+        "head_dim": "linear_head_dim",
+        "short_conv_kernel_size": "linear_conv_kernel_dim",
+        "gate_lower_bound": "linear_lower_bound",
+    }
 
     @classmethod
     def from_config(cls, config) -> "KDAParams":
+        """Every field is REQUIRED.
+
+        This used to fall back to the released values (kernel 4, bound -5.0) and read
+        ``linear_short_conv_kernel_size`` / ``linear_gate_lower_bound`` -- names the
+        front-end config does not have (it says ``linear_conv_kernel_dim`` /
+        ``linear_lower_bound``). So against the real config object both silently took
+        the default, which happens to be the right answer: a wired call site and an
+        unwired one were indistinguishable, and any config with a different kernel
+        width or gate bound would have been wrong without a sound. A missing field is
+        now an ``AttributeError``/``KeyError``, not a guess.
+        """
         la = getattr(config, "linear_attn_config", None)
-        get = (lambda k, d: la.get(k, d)) if isinstance(la, dict) else (
-            lambda k, d: getattr(config, f"linear_{k}", getattr(config, k, d)))
+        if isinstance(la, dict):
+            get = la.__getitem__
+        else:
+            get = lambda k: getattr(config, cls._FLAT[k])  # noqa: E731
         return cls(
-            num_heads=get("num_heads", 64),
-            head_dim=get("head_dim", 128),
-            conv_kernel=get("short_conv_kernel_size", 4),
-            gate_lower_bound=get("gate_lower_bound", -5.0),
-            hidden_size=getattr(config, "hidden_size", 4096),
-            rms_norm_eps=getattr(config, "rms_norm_eps", 1e-5),
+            num_heads=get("num_heads"),
+            head_dim=get("head_dim"),
+            conv_kernel=get("short_conv_kernel_size"),
+            gate_lower_bound=get("gate_lower_bound"),
+            hidden_size=config.hidden_size,
+            rms_norm_eps=config.rms_norm_eps,
         )
 
 
@@ -130,6 +158,26 @@ class ForgetGate(nn.Module):
         g = g.view(*x.shape[:2], self.H, self.K)
         decay = torch.exp(self.A_log.float()).view(1, 1, self.H, 1)
         return self.lower * torch.sigmoid(decay * g)
+
+
+def _last_real_columns(x: torch.Tensor, real: torch.Tensor, count: int) -> torch.Tensor:
+    """The last ``count`` columns of ``x`` ``[B, C, L]`` at which ``real`` ``[B, L]`` is
+    True, oldest first, zero-filled where the sequence is shorter than ``count``.
+
+    Selected by arithmetic, not by an index computed from the data. Counting the real
+    tokens and slicing at that count is a data-dependent index, and that form **silently
+    miscompiles on Neuron** (``qwen3_5/deltanet.py::_tail_rows`` measured relative error
+    1.5 on device, compiling without complaint). With ``r[t] = 1`` for real ``t``,
+    ``r[t] - r[t+1]`` is one-hot at the last real column; shifting it left by ``j``
+    moves it ``j`` columns back. Every index is a compile-time constant, and the
+    contraction against a one-hot is exact. Requires the pads to follow the real
+    tokens, which is how the plugin pads.
+    """
+    r = real.to(x.dtype)
+    last = r - F.pad(r[:, 1:], (0, 1))                                  # [B, L]
+    sel = torch.stack([F.pad(last[:, count - 1 - j:], (0, count - 1 - j))
+                       for j in range(count)], 1)                       # [B, count, L]
+    return torch.einsum("bcl,bjl->bcj", x, sel)
 
 
 def recurrent_step(q, k, v, g, beta, state):
@@ -214,7 +262,7 @@ class Glm5NextKDA(nn.Module):
     Both shapes and dtypes come from ``MambaStateShapeCalculator.kda_state_shape`` /
     ``kda_state_dtype`` — **do not re-derive them here.** vLLM sizes the state pages
     from the same helper, so a divergent layout aliases memory rather than raising.
-    The cache binding itself is dev3's surface; ``forward`` is left as the seam.
+    ``forward`` binds both to the cache through ``kv_cache.state_page_indices``.
     """
 
     def __init__(self, config, layer_idx: int, tp_size: int = 1):
@@ -274,20 +322,38 @@ class Glm5NextKDA(nn.Module):
         self._capture("core_pre_norm", core)
         return self.o_proj(self.o_norm(core, gate).reshape(B, S, -1))
 
-    def forward_prefill(self, hidden_states, conv_state=None, rec_state=None):
+    def forward_prefill(self, hidden_states, conv_state=None, rec_state=None, real=None):
         """Chunked prefill -> (output, (conv_state, recurrent_state)).
 
         The state return is for testing and for callers that manage state directly;
         the framework path in ``forward`` writes it back to the KV cache instead.
+
+        ``real`` (``[B, S]`` bool) marks real tokens when the sequence was padded to a
+        compiled bucket. The plugin pads by *appending*, so every pad sits after the
+        last real token: pads cannot affect a real token's output (both the conv and
+        the recurrence are causal), but they would advance the state. So at a pad the
+        projected q/k/v are zeroed before the conv, and ``g``/``beta`` are zeroed --
+        decay ``exp(0) == 1``, delta update ``0`` -- which makes the recurrence a
+        no-op there, and the conv window handed to decode is the last ``kernel``
+        *real* columns rather than the last ``kernel`` columns.
         """
         B, S, _ = hidden_states.shape
         qkv, g, beta, gate = self._project(hidden_states)
         kernel = self.conv1d.weight.shape[-1]
+        if real is not None:
+            qkv = qkv * real[:, None, :].to(qkv.dtype)
+            g = g * real[:, :, None, None].to(g.dtype)
+            beta = beta * real[:, :, None].to(beta.dtype)
         if conv_state is not None:
             qkv = torch.cat([conv_state, qkv], -1)
+            if real is not None:
+                real = torch.cat([real.new_ones(B, conv_state.shape[-1]), real], -1)
         pre = qkv
         qkv = F.silu(self.conv1d(qkv)[..., :qkv.shape[-1]])[..., -S:]
-        conv_state = F.pad(pre, (max(0, kernel - pre.shape[-1]), 0))[..., -kernel:]
+        if real is None:
+            conv_state = F.pad(pre, (max(0, kernel - pre.shape[-1]), 0))[..., -kernel:]
+        else:
+            conv_state = _last_real_columns(pre, real, kernel)
         self._capture("conv_window", conv_state)
         q, k, v = (t.reshape(B, S, self.H, self.K)
                    for t in qkv.transpose(1, 2).split([self.HK] * 3, -1))
@@ -313,7 +379,7 @@ class Glm5NextKDA(nn.Module):
         self._capture("recurrent_state", rec_state)
         return self._finish(core, gate, B, S), (conv_state, rec_state)
 
-    # -- framework surface (state binding is dev3's; the pattern is deltanet.py's) --
+    # -- framework surface (the pattern is deltanet.py's) --
     @property
     def conv_numel(self) -> int:
         return (self.p.conv_kernel - 1) * 3 * self.HK
@@ -359,14 +425,23 @@ class Glm5NextKDA(nn.Module):
         self.state_pages.index_copy_(0, indices, torch.cat(parts, dim=1))
 
     def forward(self, hidden_states, positions, attn_metadata: dict) -> torch.Tensor:
-        """Framework entry point. Returns a plain tensor; state goes to the KV cache.
+        """Framework entry point: ``[tokens, hidden] -> [tokens, hidden]``.
 
-        ``state_indices`` returns a *pair* for a reason worth not rediscovering: padded
-        batch rows must READ a zero page (a dead row reading another group's bytes as
-        float32 hands NaN logits to every live row, because the sampler's argmax
-        reduces across the whole tile) and must WRITE somewhere else (writing the zero
-        page is what would stop it being zeros). That helper is ``deltanet``'s and
-        belongs in shared code rather than copied here — flagged to dev3.
+        State lives in the bound page, one row per request holding ``conv ‖ recurrent``.
+        The cached conv state is vLLM's ``[kernel - 1, conv_dim]`` (the ``kda_state_shape``
+        that sized the page); ``forward_decode`` works on a ``[conv_dim, kernel]`` window,
+        so the decode path prepends a placeholder column (rolled out before it is read)
+        and stores the newest ``kernel - 1`` columns back.
+
+        **Prefill starts from a zero state and never reads the page.** The page a fresh
+        sequence is handed may hold another group's bytes -- block ids are global, so
+        it can be a recycled attention page -- and the plugin does not support chunked
+        prefill or prefix caching over recurrent state, so there is no prior state to
+        read. Decode reads through ``state_page_indices``, which sends padded rows to
+        the runner's zero page and their writes to its sink.
+
+        Returns this rank's partial output: ``o_proj`` is row-parallel under TP and the
+        caller reduces.
         """
         if not hasattr(self, "state_pages"):
             raise RuntimeError(
@@ -374,27 +449,38 @@ class Glm5NextKDA(nn.Module):
                 f"runner binds state before the first forward"
             )
         metadata = attn_metadata[self.layer_name]
-        num_reqs = metadata["block_table_tensor"].shape[0]
-        read_idx, write_idx = self.state_indices(metadata, num_reqs)
-        conv, rec = self._read_states(read_idx)
+        num_pages = self.state_pages.shape[0]
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
-            out, (conv, rec) = self.forward_decode(hidden_states, conv, rec)
-        else:
-            out, (conv, rec) = self.forward_prefill(hidden_states, conv, rec)
-        self._write_states(write_idx, conv, rec)
-        return out
+            n = metadata["block_table_tensor"].shape[0]
+            if hidden_states.shape[0] != n:
+                raise NotImplementedError(
+                    f"KDA decode expects one token per request, got "
+                    f"{hidden_states.shape[0]} tokens for {n} requests; multi-token "
+                    f"decode (speculative decoding) needs one recurrent step per draft"
+                )
+            read_idx, write_idx = self.state_indices(metadata, n)
+            conv_prev, rec = self._read_states(read_idx)            # [n, k-1, C], [n,H,K,V]
+            window = torch.cat(
+                [conv_prev.new_zeros(n, 3 * self.HK, 1), conv_prev.transpose(1, 2)], -1
+            ).to(hidden_states.dtype)
+            out, (window, rec) = self.forward_decode(hidden_states[:, None], window, rec)
+            self._write_states(write_idx, window[..., 1:].transpose(1, 2), rec)
+            return out[:, 0]
+
+        tokens = hidden_states.shape[0]
+        offsets = torch.arange(tokens, device=positions.device, dtype=positions.dtype)
+        real = (positions - positions[0]) == offsets
+        out, (window, rec) = self.forward_prefill(hidden_states[None], real=real[None])
+        _, write_idx = self.state_indices(metadata, 1)
+        self._write_states(write_idx, window[..., 1:].transpose(1, 2), rec)
+        return out[0]
 
     def state_indices(self, metadata: dict, num_reqs: int):
-        """NOT IMPLEMENTED HERE ON PURPOSE.
+        """``(read, write)`` page per request, from the shared implementation.
 
-        ``deltanet.state_indices`` is ~40 lines of padded-batch redirect logic with
-        two version-sensitive details (vLLM 0.24 changed the padding sentinel from
-        ``PAD_SLOT_ID`` -1 to ``NULL_BLOCK_ID`` 0, and an out-of-range page id is an
-        out-of-bound indirect DMA on device rather than a wrapped index). Copying it
-        would put a second copy of that reasoning in the tree, which is how the two
-        drift apart. It should be lifted into shared code; raised with dev3, who owns
-        the cache surface.
+        ``kv_cache.state_page_indices`` was lifted out of ``qwen3_5/deltanet.py`` so
+        both models use one copy: it carries the PAD_SLOT_ID -> NULL_BLOCK_ID sentinel
+        change, an out-of-bound-DMA bound check, and the padded-row read/write split
+        whose failure mode is NaN logits spreading across a whole batch tile.
         """
-        raise NotImplementedError(
-            "lift deltanet.state_indices into shared code and call it here"
-        )
+        return state_page_indices(metadata, num_reqs, self.state_pages.shape[0])
