@@ -30,10 +30,11 @@ are easy to get wrong and invisible end to end, each guarded below:
 * The final stream collapse is an **unweighted mean** (transformers'
   ``Glm5NextTextHyperHead``), unlike DeepSeek-V4.
 
-The MoE here is the **torch correctness baseline**: a dense contraction over every
-expert with a zero routing weight for the unselected ones. Exact, static-shaped and
-compilable at a tiny config; hopeless at 288 experts. The device path is the NKI MoE
-kernels (``NF.moe_cte`` / ``NF.moe_block_tkg``, as ``gpt_oss/model_bf16.py``), not wired.
+Routed experts run through the plugin's NKI MoE ops where a kernel can run --
+``NF.build_blockwise_mapping`` + ``NF.moe_cte`` for prefill, ``NF.moe_tkg`` for decode,
+as ``gpt_oss/model_bf16.py`` -- and through a dense torch contraction over every local
+expert everywhere else; the dense path is also the reference they are diffed against.
+The router is always torch: no NKI router expresses noaux_tc (see ``Glm5NextRouter``).
 
 Tensor parallelism (``_attach_weight_loaders`` is the one table of what is sharded):
 
@@ -56,6 +57,7 @@ after the mixer and after the (routed + shared) MLP.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 import torch
@@ -196,42 +198,183 @@ class Glm5NextRouter(nn.Module):
         self.top_k, self.scale, self.norm = top_k, routed_scaling_factor, norm_topk_prob
 
     def forward(self, x: torch.Tensor):
-        """``[T, D]`` -> routing matrix ``[T, E]`` fp32, zero off the top-k."""
+        """``[T, D]`` -> (routing matrix ``[T, E]`` fp32, zero off the top-k; indices
+        ``[T, top_k]``).
+
+        Torch, deliberately, on every path. The plugin's ``NF.router``, nkilib's
+        ``router_topk`` and the fused ``moe_block_tkg`` all add their bias to the logits
+        *before* the activation and select on the biased scores. noaux_tc needs the
+        opposite: the correction bias chooses experts and the UNbiased sigmoid scores
+        weight them. None of them can express that.
+        """
         scores = F.linear(x.float(), self.weight.float()).sigmoid()
         idx = torch.topk(scores + self.e_score_correction_bias.float(), self.top_k, -1,
                          sorted=False).indices
         w = scores.gather(1, idx)
         if self.norm:
             w = w / (w.sum(-1, keepdim=True) + 1e-20)
-        return torch.zeros_like(scores).scatter(1, idx, w * self.scale)
+        return torch.zeros_like(scores).scatter(1, idx, w * self.scale), idx
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpertLayout:
+    """Where this rank's routed experts come from: ``ep_degree`` disjoint expert groups,
+    each expert's intermediate dim split over ``tp_degree`` ranks.
+
+    ``ep_degree * tp_degree`` is the TP world. Partial outputs from every (expert group,
+    intermediate shard) pair are summed by the decoder layer's single all-reduce, so the
+    layout changes which rank computes what, never the result.
+
+    Why expert parallelism at all: ``NF.moe_cte``'s kernel guard refuses
+    ``I_TP < 128``, and tensor parallelism alone at TP=64 gives ``2048 / 64 = 32``. The
+    kernel path therefore needs ``tp_degree <= 16``, i.e. ``ep_degree >= 4`` with
+    ``288 % ep_degree == 0``. On device the coordinates come from the plugin's parallel
+    state (``get_neuron_ep_rank`` / ``get_neuron_ep_tp_group``), because trn2's 8x8 mesh
+    is non-contiguous and ``rank // tp_degree`` is not the expert group there.
+    """
+
+    ep_degree: int = 1
+    ep_rank: int = 0
+    tp_degree: int = 1
+    tp_rank: int = 0
+    ep_tp_group: object = None     # build_blockwise_mapping's moe_group
+
+    def first_local_expert(self, n_experts: int) -> int:
+        return self.ep_rank * (n_experts // self.ep_degree)
+
+
+# Selects the routed-expert implementation; "auto" uses the NKI MoE ops where a kernel
+# can run and the dense reference elsewhere. "nf" forces the NF ops (on CPU: their torch
+# fallbacks), "dense" forces the reference.
+_MOE_IMPL_ENV = "VLLM_NEURON_GLM5NEXT_MOE"
 
 
 class Glm5NextMoE(nn.Module):
     """Routed experts plus one shared expert.
 
-    ``gate_up_proj [E, 2I, D]`` (gate rows first) and ``down_proj [E, D, I]``, the
-    transformers / oracle stacking of the checkpoint's per-expert tensors.
+    Expert weights are stored in the NKI MoE kernels' layout:
+    ``gate_up_proj [E_local, D, 2, I_TP]`` (``[..., 0, :]`` gate, ``[..., 1, :]`` up) and
+    ``down_proj [E_local, I_TP, D]`` -- what ``NF.moe_cte`` and ``NF.moe_tkg`` take, so no
+    per-step relayout of the expert weights.
+
+    Three implementations of the routed sum, one contract (the router's ``[T, E]``
+    affinities, already normalised and scaled by 2.5):
+
+    * ``_routed_dense``: a contraction over every local expert with zero weight for the
+      unselected ones. Exact, static-shaped, the reference the others are diffed against;
+      unusable at 288 experts.
+    * ``_routed_nf_prefill``: ``NF.build_blockwise_mapping`` + ``NF.moe_cte``.
+    * ``_routed_nf_decode``: ``NF.moe_tkg`` (kernel only -- it has no CPU path).
+
+    The shared expert sees the same input, is added after the routed sum, and is never
+    multiplied by a routing weight. It is tensor-parallel over the whole TP world.
     """
+
+    block_size = 256        # NF.moe_cte tokens per block, as gpt_oss
 
     def __init__(self, hidden_size: int, moe_intermediate_size: int, n_experts: int,
                  top_k: int, n_shared_experts: int, routed_scaling_factor: float,
-                 norm_topk_prob: bool, limit: float):
+                 norm_topk_prob: bool, limit: float, layout: ExpertLayout, world: int):
         super().__init__()
-        I = moe_intermediate_size
-        self.I, self.limit = I, limit
+        if n_experts % layout.ep_degree or moe_intermediate_size % layout.tp_degree:
+            raise ValueError(
+                f"{n_experts} experts x {moe_intermediate_size} intermediate do not "
+                f"divide over EP={layout.ep_degree} x TP={layout.tp_degree}")
+        self.layout, self.limit, self.top_k = layout, limit, top_k
+        self.E, self.E_local = n_experts, n_experts // layout.ep_degree
+        self.e0 = layout.first_local_expert(n_experts)
+        self.I_tp = moe_intermediate_size // layout.tp_degree
         self.gate = Glm5NextRouter(n_experts, hidden_size, top_k,
                                    routed_scaling_factor, norm_topk_prob)
-        self.gate_up_proj = nn.Parameter(torch.zeros(n_experts, 2 * I, hidden_size))
-        self.down_proj = nn.Parameter(torch.zeros(n_experts, hidden_size, I))
-        self.shared_experts = Glm5NextMLP(hidden_size, I * n_shared_experts, limit)
+        self.gate_up_proj = nn.Parameter(torch.zeros(self.E_local, hidden_size, 2, self.I_tp))
+        self.down_proj = nn.Parameter(torch.zeros(self.E_local, self.I_tp, hidden_size))
+        self.shared_experts = Glm5NextMLP(
+            hidden_size, moe_intermediate_size * n_shared_experts // world, limit)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        routing = self.gate(x)                                            # [T, E] fp32
-        gu = torch.einsum("td,efd->tef", x, self.gate_up_proj)            # [T, E, 2I]
-        h = _clamped_swiglu(gu[..., : self.I], gu[..., self.I:], self.limit)
-        y = torch.einsum("tei,edi->ted", h, self.down_proj)               # [T, E, D]
+    # -- the routed sum ---------------------------------------------------------------
+    def _routed_dense(self, x, local):
+        gu = torch.einsum("td,edgi->tegi", x, self.gate_up_proj)          # [T, E_l, 2, I]
+        h = _clamped_swiglu(gu[:, :, 0], gu[:, :, 1], self.limit)         # [T, E_l, I]
+        y = torch.einsum("tei,eid->ted", h, self.down_proj)               # [T, E_l, D]
         # routing weight applied in fp32, to the ROUTED sum only
-        routed = torch.einsum("te,ted->td", routing, y.float()).to(x.dtype)
+        return torch.einsum("te,ted->td", local, y.float()).to(x.dtype)
+
+    def _nf_clamps(self):
+        return dict(gate_clamp_upper_limit=self.limit, gate_clamp_lower_limit=None,
+                    up_clamp_upper_limit=self.limit, up_clamp_lower_limit=-self.limit)
+
+    def _routed_nf_prefill(self, x, local, real, rank):
+        import nki.language as nl
+        from nkilib.core.moe.moe_cte.moe_cte import (
+            ActFnType, ExpertAffinityScaleMode, MoECTEImplementation)
+
+        from vllm_neuron import functional as NF
+
+        masked, pos_to_id, block_to_expert, conditions = NF.build_blockwise_mapping(
+            expert_affinities=local, num_local_experts=self.E_local,
+            num_experts_per_token=self.top_k, block_size=self.block_size,
+            moe_group=self.layout.ep_tp_group, tp_degree=self.layout.tp_degree,
+            padding_mask=real, rank=rank)
+        return NF.moe_cte(
+            implementation=MoECTEImplementation.shard_on_block, conditions=conditions,
+            hidden_states=x, expert_affinities_masked=masked,
+            gate_up_proj_weight=self.gate_up_proj, down_proj_weight=self.down_proj,
+            activation_function=ActFnType.SiLU, block_size=self.block_size,
+            token_position_to_id=pos_to_id.to(torch.int32),
+            block_to_expert=block_to_expert.to(torch.int32),
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            skip_token=True, is_tensor_update_accumulating=True,
+            compute_dtype=nl.bfloat16, **self._nf_clamps())
+
+    def _routed_nf_decode(self, x, routing, idx):
+        from nkilib.core.moe.moe_cte.moe_cte import ActFnType, ExpertAffinityScaleMode
+
+        from vllm_neuron import functional as NF
+
+        all_expert = self.layout.ep_degree > 1
+        return NF.moe_tkg(
+            hidden_input=x, expert_gate_up_weights=self.gate_up_proj,
+            expert_down_weights=self.down_proj, expert_affinities=routing.to(x.dtype),
+            expert_index=idx.to(torch.int32), is_all_expert=all_expert,
+            rank_id=(torch.tensor([[self.layout.ep_rank]], dtype=torch.int32,
+                                  device=x.device) if all_expert else None),
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            activation_fn=ActFnType.SiLU, **self._nf_clamps())
+
+    def _impl(self, x, is_decode: bool) -> str:
+        import os
+
+        mode = os.environ.get(_MOE_IMPL_ENV, "auto")
+        if mode not in ("auto", "nf", "dense"):
+            raise ValueError(f"{_MOE_IMPL_ENV}={mode!r}: expected auto, nf or dense")
+        if mode == "dense":
+            return "dense"
+        try:
+            from vllm_neuron.utils.neuron_utils import can_run_kernel
+            on_device = can_run_kernel(x)
+        except ImportError:                       # the oracle laptop: no plugin runtime
+            return "dense"
+        if mode == "nf":
+            # moe_tkg has no CPU path; off device decode goes through the blockwise path
+            return "nf_decode" if (is_decode and on_device) else "nf_prefill"
+        if not on_device:
+            return "dense"
+        if is_decode:
+            return "nf_decode"
+        # NF.moe_cte's kernel guard: below 128 it would fall back to its own dense
+        # torch loop over every expert, which is the reference path with extra steps
+        return "nf_prefill" if self.I_tp >= 128 else "dense"
+
+    def forward(self, x, is_decode: bool = False, real=None, rank=None):
+        routing, idx = self.gate(x)                                       # [T, E], [T, k]
+        local = routing.narrow(1, self.e0, self.E_local)
+        impl = self._impl(x, is_decode)
+        if impl == "dense":
+            routed = self._routed_dense(x, local)
+        elif impl == "nf_prefill":
+            routed = self._routed_nf_prefill(x, local, real, rank)
+        else:
+            routed = self._routed_nf_decode(x, routing, idx)
         return routed + self.shared_experts(x)
 
 
@@ -240,7 +383,8 @@ class Glm5NextDecoderLayer(nn.Module):
     """``attn_hc -> input_layernorm -> mixer -> expand``, then
     ``ffn_hc -> post_attention_layernorm -> MLP/MoE -> expand``."""
 
-    def __init__(self, config, layer_idx: int, tp_size: int = 1, reduce=None):
+    def __init__(self, config, layer_idx: int, tp_size: int = 1, reduce=None,
+                 expert_layout: ExpertLayout | None = None):
         super().__init__()
         self.layer_idx = layer_idx
         layer_type = config.layer_types[layer_idx]
@@ -255,9 +399,10 @@ class Glm5NextDecoderLayer(nn.Module):
         D = config.hidden_size
         if mlp_type == SPARSE_MLP:
             self.mlp = Glm5NextMoE(
-                D, config.moe_intermediate_size // tp_size, config.n_routed_experts,
+                D, config.moe_intermediate_size, config.n_routed_experts,
                 config.num_experts_per_tok, config.n_shared_experts,
-                config.routed_scaling_factor, config.norm_topk_prob, config.swiglu_limit)
+                config.routed_scaling_factor, config.norm_topk_prob, config.swiglu_limit,
+                expert_layout or ExpertLayout(tp_degree=tp_size), world=tp_size)
         elif mlp_type == DENSE_MLP:
             self.mlp = Glm5NextMLP(D, config.intermediate_size // tp_size, config.swiglu_limit)
         else:
@@ -274,21 +419,33 @@ class Glm5NextDecoderLayer(nn.Module):
     def mixer_name(self) -> str:
         return self.self_attn.layer_name
 
-    def forward(self, streams, positions, attn_metadata):
+    def forward(self, streams, positions, attn_metadata, rank=None):
         residual = streams
         post, comb, h = self.attn_hc(streams)
         h = self._reduce(self.self_attn(self.input_layernorm(h), positions, attn_metadata))
         streams = hc_expand(post, comb, h, residual)
         residual = streams
         post, comb, h = self.ffn_hc(streams)
-        h = self._reduce(self.mlp(self.post_attention_layernorm(h)))
-        return hc_expand(post, comb, h, residual)
+        h = self.post_attention_layernorm(h)
+        if isinstance(self.mlp, Glm5NextMoE):
+            md = attn_metadata[self.mixer_name]
+            is_decode = md["max_query_len"] <= md["decode_token_threshold"]
+            real = None
+            if not is_decode:              # pads are appended, last position repeated
+                offsets = torch.arange(positions.shape[0], device=positions.device,
+                                       dtype=positions.dtype)
+                real = (positions - positions[0]) == offsets
+            h = self.mlp(h, is_decode=is_decode, real=real, rank=rank)
+        else:
+            h = self.mlp(h)
+        return hc_expand(post, comb, self._reduce(h), residual)
 
 
 class Glm5NextTextModel(nn.Module):
     """Embedding -> ``hc_mult`` copies -> 45 layers -> unweighted stream mean -> norm."""
 
-    def __init__(self, config, tp_size: int = 1, reduce=None, tp_device_group=None):
+    def __init__(self, config, tp_size: int = 1, reduce=None, tp_device_group=None,
+                 expert_layout: ExpertLayout | None = None):
         super().__init__()
         self.config = config
         self.embed_tokens = VocabDimShardedEmbedding(config.vocab_size, config.hidden_size,
@@ -296,7 +453,8 @@ class Glm5NextTextModel(nn.Module):
         if self.embed_tokens.tp_size != tp_size:
             raise ValueError(f"embedding sees TP={self.embed_tokens.tp_size}, model TP={tp_size}")
         self.layers = nn.ModuleList(
-            Glm5NextDecoderLayer(config, i, tp_size=tp_size, reduce=reduce)
+            Glm5NextDecoderLayer(config, i, tp_size=tp_size, reduce=reduce,
+                                 expert_layout=expert_layout)
             for i in range(config.num_hidden_layers)
         )
         self.norm = Glm5NextRMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -306,8 +464,24 @@ class Glm5NextTextModel(nn.Module):
         streams = h.unsqueeze(-2).expand(*h.shape[:-1], self.config.hc_mult, h.shape[-1])
         streams = streams.contiguous()
         for layer in self.layers:
-            streams = layer(streams, positions, attn_metadata)
+            streams = layer(streams, positions, attn_metadata, rank=rank)
         return self.norm(streams.mean(-2))
+
+
+def state_dict_from_reference(sd: dict) -> dict:
+    """The oracle's / transformers' state dict (stacked experts ``[E, 2I, D]`` gate rows
+    first, ``[E, D, I]``) -> this model's at TP=1, EP=1 (kernel layout
+    ``[E, D, 2, I]`` / ``[E, I, D]``, ``model.`` prefix). For tests that load reference
+    weights directly; checkpoints go through ``load_weights``."""
+    out = {}
+    for k, v in sd.items():
+        if k.endswith("mlp.gate_up_proj") and v.dim() == 3:
+            E, two_i, D = v.shape
+            v = v.reshape(E, 2, two_i // 2, D).permute(0, 3, 1, 2).contiguous()
+        elif k.endswith("mlp.down_proj") and v.dim() == 3:
+            v = v.permute(0, 2, 1).contiguous()
+        out[k if k == "lm_head.weight" else f"model.{k}"] = v
+    return out
 
 
 # ------------------------------------------------------------------------ ForCausalLM
@@ -326,10 +500,11 @@ class Glm5NextForCausalLM(nn.Module):
     # ``initialize_kv_cache``.
     kv_cache_page_major = True
 
-    def __init__(self, config, tp_group=None):
+    def __init__(self, config, tp_group=None, expert_layout: ExpertLayout | None = None):
         """``tp_group``: vLLM's ``GroupCoordinator`` for the TP group (``world_size``,
         ``rank_in_group``, ``all_reduce`` returning its result, ``all_gather``,
-        ``device_group``), or anything with that surface; ``None`` means TP=1."""
+        ``device_group``), or anything with that surface; ``None`` means TP=1.
+        ``expert_layout``: the routed experts' EP x TP placement; default pure TP."""
         super().__init__()
         text = config.text_config
         self.config, self.text_config = config, text
@@ -349,8 +524,14 @@ class Glm5NextForCausalLM(nn.Module):
         self.on_device_sampling_config = (
             getattr(nc, "on_device_sampling_config", None) if nc is not None else None
         )
+        self.expert_layout = expert_layout or ExpertLayout(
+            tp_degree=self.world_size, tp_rank=self.rank, ep_tp_group=tp_group)
+        L = self.expert_layout
+        if L.ep_degree * L.tp_degree != self.world_size:
+            raise ValueError(f"EP={L.ep_degree} x TP={L.tp_degree} != TP world {self.world_size}")
         self.model = Glm5NextTextModel(text, tp_size=self.world_size, reduce=self._all_reduce,
-                                       tp_device_group=device_group)
+                                       tp_device_group=device_group,
+                                       expert_layout=self.expert_layout)
         self.lm_head = ColumnParallelLinear(
             text.hidden_size, text.vocab_size, bias=False,
             gather_output=self.on_device_sampling_config is None, tp_group=device_group)
@@ -473,7 +654,19 @@ class Glm5NextForCausalLM(nn.Module):
         from .config import Glm5NextConfig
 
         config = Glm5NextConfig.from_configs(hf_config, text_neuron_config=text_neuron_config)
-        model = cls(config, tp_group=get_tp_group())
+        tp = get_tp_group()
+        layout = None
+        if getattr(text_neuron_config, "ep_degree", 1) > 1:
+            # [unverified on device] the plugin's EP groups, as gpt_oss reads them
+            from vllm_neuron.parallel.neuron_parallel_state import (
+                get_neuron_ep_degree, get_neuron_ep_rank, get_neuron_ep_tp_group)
+
+            ep_tp = get_neuron_ep_tp_group()
+            layout = ExpertLayout(ep_degree=get_neuron_ep_degree(),
+                                  ep_rank=get_neuron_ep_rank(),
+                                  tp_degree=ep_tp.world_size, tp_rank=ep_tp.rank_in_group,
+                                  ep_tp_group=ep_tp)
+        model = cls(config, tp_group=tp, expert_layout=layout)
         return model.set_dtype(config.text_config.torch_dtype)
 
     def checkpoint_mappings(self) -> dict[str, object]:
@@ -568,12 +761,7 @@ class Glm5NextForCausalLM(nn.Module):
         # q, k, v depthwise convs: shard each by head, then concatenate per rank
         conv = SafetensorsWeightLoader(
             transform=lambda s, r: torch.cat([shard(x, 0, r) for x in s], 0))
-        # [gate_0, up_0, gate_1, up_1, ...]: shard gate and up rows inside every expert
-        gate_up = SafetensorsWeightLoader(transform=lambda s, r: torch.stack([
-            torch.cat([shard(s[2 * e], 0, r), shard(s[2 * e + 1], 0, r)], 0)
-            for e in range(len(s) // 2)]))
-        down = SafetensorsWeightLoader(
-            transform=lambda s, r: torch.stack([shard(x, 1, r) for x in s]))
+        gate_up, down = self.expert_loaders(self.expert_layout)
 
         for layer in self.model.layers:
             a = layer.self_attn
@@ -597,6 +785,32 @@ class Glm5NextForCausalLM(nn.Module):
             set_weight_loader(mlp.gate_proj.weight, rows)
             set_weight_loader(mlp.up_proj.weight, rows)
             set_weight_loader(mlp.down_proj.weight, cols)
+
+    def expert_loaders(self, layout: ExpertLayout):
+        """``(gate_up, down)`` loaders for the routed experts at ``layout``: that expert
+        group (EP) and intermediate shard (TP inside the group), into the kernels'
+        ``[E_l, D, 2, I_tp]`` / ``[E_l, I_tp, D]`` layout.
+
+        The coordinates are the layout's, not the loader's ``rank`` argument: under EP
+        the TP rank is not the intermediate-shard index (trn2's mesh is non-contiguous).
+        A function of the layout so a test can build the loaders for a WRONG layout.
+        """
+        from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, get_shard
+
+        E_l = self.text_config.n_routed_experts // layout.ep_degree
+        e0 = layout.ep_rank * E_l
+
+        def ishard(t, dim):
+            size = t.get_shape()[dim] // layout.tp_degree
+            return get_shard(t, dim, size, layout.tp_degree, layout.tp_rank)
+
+        # [gate_0, up_0, gate_1, up_1, ...] -> per local expert stack([gate^T, up^T], 1)
+        gate_up = SafetensorsWeightLoader(transform=lambda s, r: torch.stack([
+            torch.stack([ishard(s[2 * e], 0).T, ishard(s[2 * e + 1], 0).T], 1)
+            for e in range(e0, e0 + E_l)]))
+        down = SafetensorsWeightLoader(transform=lambda s, r: torch.stack([
+            ishard(s[e], 1).T for e in range(e0, e0 + E_l)]))
+        return gate_up, down
 
     def load_weights(self, checkpoint_path: str, device: torch.device,
                      cache_dir: str | None = None) -> None:
