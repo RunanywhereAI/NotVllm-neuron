@@ -34,7 +34,7 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 _PACKAGES = ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.glm5_next",
              "vllm_neuron.functional", "vllm_neuron.functional.vendored_kernels",
-             "vllm_neuron.utils", "vllm_neuron.accuracy")
+             "vllm_neuron.utils", "vllm_neuron.accuracy", "vllm_neuron.nn")
 
 
 def import_plugin(dotted: str):
@@ -154,6 +154,18 @@ def plugin_state_from_oracle(oracle_sd):
 
 
 # ------------------------------------------------------------------ the fake runner
+def aligned_block_size(model, dtype=torch.float32, alignment: int = 32) -> int:
+    """The smallest multiple of ``alignment`` whose folded MLA page holds one KDA layer's
+    page-major state -- what the platform's hybrid alignment arrives at."""
+    CL = import_plugin("vllm_neuron.model.glm5_next.cache_layout")
+    kda = next(l.self_attn for l in model.model.layers if l.is_linear_attention)
+    need = 4 * (kda.conv_numel + kda.rec_numel)              # page-major view is fp32
+    B = alignment
+    while CL.LatentPageLayout.from_config(model.text_config, B, dtype).total_bytes < need:
+        B += alignment
+    return B
+
+
 class FakeRunner:
     """Allocation, binding and metadata as ``NeuronModelRunner`` does them.
 
@@ -337,3 +349,96 @@ def write_checkpoint(tensors: dict, directory, shards: int = 3):
         weight_map.update({n: fname for n in part})
     (directory / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map}))
+
+
+# ------------------------------------------------------- tensor parallelism on a laptop
+class GlooTP:
+    """The slice of vLLM's ``GroupCoordinator`` the model uses, over a gloo group.
+
+    ``all_reduce`` returns its result (vLLM's is out-of-place), and ``device_group`` is
+    what the plugin's ``VocabDimShardedEmbedding`` / ``ColumnParallelLinear`` take.
+    """
+
+    def __init__(self, world_size: int, rank: int):
+        import torch.distributed as dist
+
+        self.dist, self.world_size, self.rank_in_group = dist, world_size, rank
+        self.device_group = dist.group.WORLD
+
+    def all_reduce(self, t):
+        t = t.clone()
+        self.dist.all_reduce(t, group=self.device_group)
+        return t
+
+    def all_gather(self, t, dim=-1):
+        parts = [torch.empty_like(t) for _ in range(self.world_size)]
+        self.dist.all_gather(parts, t.contiguous(), group=self.device_group)
+        return torch.cat(parts, dim)
+
+
+SABOTAGE = {
+    # parameter -> loaded from the NEXT rank's slice on rank 1 (wrong shard, right shape)
+    "kda_conv": "model.layers.0.self_attn.conv1d.weight",
+    "mla_kv_b": "model.layers.3.self_attn.kv_b_proj.weight",
+    "expert_gate_up": "model.layers.7.mlp.gate_up_proj",
+    "kda_A_log": "model.layers.5.self_attn.forget_gate.A_log",
+}
+
+
+def tp_worker(rank, world, port, ckpt, out_path, sabotage):
+    """One TP rank: load this rank's shards from ``ckpt``, then run every prompt of
+    ``oracle_reference.json`` through ``FakeRunner`` -- one prefill per request, then
+    batched decode with a padded row -- teacher-forced on the oracle's greedy tokens so
+    every TP degree sees identical inputs. Rank 0 saves the logits."""
+    import json
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    torch.manual_seed(0)
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
+                            world_size=world)
+    try:
+        CFG = import_plugin("vllm_neuron.model.glm5_next.config")
+        M = import_plugin("vllm_neuron.model.glm5_next.model")
+        WL = import_plugin("vllm_neuron.utils.weight_loader")
+        tc = json.loads((pathlib.Path(ckpt) / "config.json").read_text())["text_config"]
+        tc["dtype"] = torch.float32
+        text = CFG.Glm5NextTextConfig.from_hf(SimpleNamespace(**tc))
+        model = M.Glm5NextForCausalLM(CFG.Glm5NextConfig(text_config=text),
+                                      tp_group=GlooTP(world, rank)).eval()
+        if sabotage and rank == 1:
+            param = dict(model.named_parameters())[SABOTAGE[sabotage]]
+            inner = WL.get_weight_loader(param)
+            WL.set_weight_loader(param, WL.SafetensorsWeightLoader(
+                transform=lambda s, r: inner.transform(s, (r + 1) % world)))
+        model.load_weights(ckpt, torch.device("cpu"))
+        ref = json.loads((pathlib.Path(ckpt) / "oracle_reference.json").read_text())
+        run = FakeRunner(model, aligned_block_size(model), num_blocks=64)
+        prompts = ref["prompts"]
+        out = {"prefill": [], "decode": []}
+        with torch.no_grad():
+            for r, p in enumerate(prompts):
+                ids = p["prompt"]
+                out["prefill"].append(run.prefill(r, ids, bucket=-(-len(ids) // 16) * 16)[-1])
+            for step in range(ref["new_tokens"] - 1):
+                rows = [(r, p["greedy"][step], len(p["prompt"]) + step)
+                        for r, p in enumerate(prompts)]
+                out["decode"].append(run.decode(rows, len(prompts) + 1))
+        if rank == 0:
+            torch.save(out, out_path)
+    finally:
+        dist.destroy_process_group()
+
+
+def run_tp(world: int, ckpt, out_path, sabotage=None):
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    mp.spawn(tp_worker, args=(world, port, str(ckpt), str(out_path), sabotage),
+             nprocs=world, join=True)
+    return torch.load(out_path)
