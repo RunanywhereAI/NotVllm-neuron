@@ -56,27 +56,42 @@ class _Cfg:
     index_topk = 2048
 
 
-def _layout(block_size=96, dtype=torch.bfloat16, **over):
+def _layout(block_size=96, dtype=torch.bfloat16, indexer_fp8=False, **over):
     cfg = _Cfg()
     for k, v in over.items():
         setattr(cfg, k, v)
-    return CL.LatentPageLayout.from_config(cfg, block_size, dtype)
+    lay = CL.LatentPageLayout.from_config(cfg, block_size, dtype)
+    if indexer_fp8:
+        import dataclasses
+        lay = dataclasses.replace(lay, indexer_fp8=True)
+    return lay
 
 
 # ------------------------------------------------------------------ the real numbers
 
 def test_region_sizes_at_the_real_config():
     """Hand-computed from the published config, so a refactor that changes any of these
-    has to change this test deliberately."""
+    has to change this test deliberately. Default format: pool keys at the page dtype."""
     lay = _layout(block_size=96)
     assert lay.latent_bytes_per_token == 512 * 2          # kv_lora_rank, bf16
-    assert lay.indexer_bytes_per_pool == 132              # 128 + 4 bytes inline scale
+    assert lay.indexer_bytes_per_pool == 128 * 2          # index_head_dim, bf16
     assert lay.pools_per_page == 24                       # 96 // 4
     assert lay.latent_bytes == 96 * 1024                  # 98304
-    assert lay.indexer_bytes == 24 * 132                  # 3168
+    assert lay.indexer_bytes == 24 * 256                  # 6144
     assert lay.tail_bytes == 4 * 2 * 128 * 2              # 2048
-    assert lay.total_bytes == 98304 + 3168 + 2048         # 103520
+    assert lay.total_bytes == 98304 + 6144 + 2048         # 106496, no padding needed
+    assert lay.total_elems % 512 == 0 and lay.total_elems % 128 == 0
     print(f"\n  {lay.describe()}")
+
+
+def test_region_sizes_in_vllms_fp8_format():
+    """vLLM's own format, kept as arithmetic: 128 fp8 bytes + 4 bytes of inline scale."""
+    lay = _layout(block_size=96, indexer_fp8=True)
+    assert lay.indexer_bytes_per_pool == 132
+    assert lay.indexer_bytes == 24 * 132                  # 3168
+    assert lay.total_bytes == 98304 + 3168 + 2048         # 103520
+    with pytest.raises(NotImplementedError, match="FP8"):
+        lay.latent_row(0, 0)
 
 
 def test_offsets_tile_the_page_without_gap_or_overlap():
@@ -98,7 +113,7 @@ def test_the_indexer_page_is_why_folding_is_necessary():
     indexer page divide the latent page, and 132 is the reason."""
     ratios = []
     for b in (32, 64, 96, 128, 256, 512):
-        lay = _layout(block_size=b)
+        lay = _layout(block_size=b, indexer_fp8=True)
         ratios.append(lay.latent_bytes / lay.indexer_bytes)
     assert len({round(r, 9) for r in ratios}) == 1, (
         f"ratio should be block-size independent, got {ratios}"
@@ -130,9 +145,11 @@ def test_regions_stay_element_addressable():
         assert n % lay.element_size == 0
 
 
-def test_odd_index_head_dim_is_rejected():
+def test_odd_index_head_dim_is_rejected_in_fp8_format():
+    """The inline scale count is ``index_head_dim // 128``; only the FP8 format has it."""
     with pytest.raises(ValueError, match="multiple of quant_block_size"):
-        _layout(index_head_dim=100)
+        _layout(index_head_dim=100, indexer_fp8=True)
+    _layout(index_head_dim=32)          # page-dtype pool keys have no scale block
 
 
 # --------------------------------------------------------------- the capacity wall
@@ -222,3 +239,68 @@ def test_the_enforcement_test_can_actually_fail(tmp_path):
         "    # latent_bytes is derived in cache_layout.py",
     ]:
         assert not define.match(benign), f"matcher false-positived on: {benign!r}"
+
+
+# ------------------------------------------------------------- addressing inside a page
+
+@pytest.mark.parametrize("kvr,D,B,dtype", [
+    (512, 128, 96, torch.bfloat16),     # the real config: no padding
+    (64, 32, 32, torch.float32),        # the tiny test config
+    (96, 64, 8, torch.float32),         # row widths that do not nest: page is padded
+])
+def test_row_addressing_round_trips_through_split(kvr, D, B, dtype):
+    """Write a distinct value at every row the model can address, through the flat
+    ``[-1, width]`` views the writes use, then read the page back through ``split``.
+
+    Fails if any helper ignores its region offset, uses the wrong rows-per-page, lets
+    two (page, token) pairs share a row, or if ``split`` disagrees with the writers --
+    i.e. exactly the silent-aliasing bugs the module exists to prevent."""
+    lay = _layout(block_size=B, dtype=dtype, kv_lora_rank=kvr, index_head_dim=D)
+    assert lay.total_elems % kvr == 0 and lay.total_elems % D == 0
+    pages = 3
+    buf = torch.full((pages, lay.total_elems), -1.0, dtype=dtype)
+    lat_rows, idx_rows = buf.view(-1, kvr), buf.view(-1, D)
+    page = torch.arange(pages).repeat_interleave(B)
+    tok = torch.arange(B).repeat(pages)
+    lat_val = (page * 1000 + tok).to(dtype)
+    lat_rows[lay.latent_row(page, tok)] = lat_val[:, None].expand(-1, kvr)
+    first = tok % lay.index_kpool == 0                        # one write per pool
+    pool_val = (page * 1000 + tok // lay.index_kpool + 500).to(dtype)
+    idx_rows[lay.pool_row(page[first], tok[first])] = pool_val[first][:, None].expand(-1, D)
+    in_ring = tok < lay.index_kpool                           # one write per ring slot
+    k_row, g_row = lay.tail_rows(page[in_ring], tok[in_ring])
+    idx_rows[k_row] = (page[in_ring] * 1000 + 700 + tok[in_ring]).to(dtype)[:, None].expand(-1, D)
+    idx_rows[g_row] = (page[in_ring] * 1000 + 800 + tok[in_ring]).to(dtype)[:, None].expand(-1, D)
+
+    latent, pools, tail = lay.split(buf)
+    want_lat = (torch.arange(pages)[:, None] * 1000 + torch.arange(B)).to(dtype)
+    assert torch.equal(latent, want_lat[..., None].expand(-1, -1, kvr))
+    want_pool = (torch.arange(pages)[:, None] * 1000 + 500
+                 + torch.arange(lay.pools_per_page)).to(dtype)
+    assert torch.equal(pools, want_pool[..., None].expand(-1, -1, D))
+    slots = torch.arange(lay.index_kpool)
+    assert torch.equal(tail[:, :, 0], (torch.arange(pages)[:, None] * 1000 + 700 + slots)
+                       .to(dtype)[..., None].expand(-1, -1, D))
+    assert torch.equal(tail[:, :, 1], (torch.arange(pages)[:, None] * 1000 + 800 + slots)
+                       .to(dtype)[..., None].expand(-1, -1, D))
+    # nothing outside the three regions was touched: only padding is still -1
+    written = (buf != -1).sum().item()
+    assert written == pages * (lay.latent_elems + lay.indexer_elems + lay.tail_elems)
+
+
+def test_addressing_test_detects_a_dropped_region_offset(monkeypatch):
+    """Non-vacuity for the round-trip above: plant the classic bug -- a pool row that
+    forgets the indexer region's offset and lands in the latent region -- and require
+    the round trip to notice."""
+    lay = _layout(block_size=32, dtype=torch.float32, kv_lora_rank=64, index_head_dim=32)
+    bad = type(lay)
+    original = bad.pool_row
+
+    def pool_row_without_offset(self, page, token_in_page):
+        per_page = self.total_elems // self.index_head_dim
+        return page * per_page + token_in_page // self.index_kpool
+
+    monkeypatch.setattr(bad, "pool_row", pool_row_without_offset)
+    with pytest.raises(AssertionError):
+        test_row_addressing_round_trips_through_split(64, 32, 32, torch.float32)
+    monkeypatch.setattr(bad, "pool_row", original)
