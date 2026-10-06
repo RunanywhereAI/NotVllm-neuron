@@ -237,3 +237,40 @@ def test_the_component_check_can_tell_20_sinkhorn_iterations_from_21():
     row_err = (comb20.sum(-1) - 1).abs().max().item()
     print(f"\n  rows off by {row_err:.2e} at 20 iterations; 21 moves comb by {gap:.2e}")
     assert gap > 1e-4
+
+
+# ------------------------------------------------------------------------- bf16
+def test_bf16_serving_path_runs_finite_and_close_to_fp32():
+    """The serving dtype: bf16 MLA pages and fp32 KDA pages viewed over one buffer, NaN
+    (0xFFFF) wherever unwritten, prefill then decode at batch 2 of 3.
+
+    No oracle comparison is possible in bf16 (the oracle is fp32 by design), and
+    discrete choices -- expert routing, indexer selection -- legitimately flip under
+    bf16, so this compares the plugin with ITSELF in fp32 at a config with neither:
+    every expert routed and the indexer above the sequence length. Measured 2026-10-06:
+    ~4% mean-relative at the logits after 8 layers, growing ~0.5%/layer, KDA the largest
+    contributor. That is a measurement on random weights, not a budget. The bound below
+    catches gross bf16 defects (a page read at the wrong dtype, a missing cast) only.
+    """
+    over = dict(index_topk=64, num_experts_per_tok=8)
+    lengths, steps = (13, 21), 6
+    outs = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        plugin, _ = _pair(seed=0, **over)
+        plugin.set_dtype(dtype)
+        run = H.FakeRunner(plugin, 64, num_blocks=16, dtype=dtype)
+        seqs = [_ids(n + steps, seed=40 + r) for r, n in enumerate(lengths)]
+        got = []
+        with torch.no_grad():
+            for r, n in enumerate(lengths):
+                got.append(run.prefill(r, seqs[r][:n], bucket=32).float())
+            for step in range(steps):
+                rows = [(r, seqs[r][n + step], n + step) for r, n in enumerate(lengths)]
+                d = run.decode(rows, 3).float()
+                assert torch.isfinite(d).all(), f"{dtype} step {step}: non-finite"
+                got.append(d[: len(lengths)])
+        outs[dtype] = torch.cat(got)
+    a, b = outs[torch.float32], outs[torch.bfloat16]
+    mean_rel = ((a - b).abs().mean() / a.abs().mean()).item()
+    print(f"\n  bf16 vs fp32 (plugin): mean rel {mean_rel:.2e}")
+    assert mean_rel < 0.15
