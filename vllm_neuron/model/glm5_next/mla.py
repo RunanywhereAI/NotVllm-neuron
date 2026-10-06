@@ -452,8 +452,11 @@ class Glm5NextSparseMLA(nn.Module):
         _capture_tensor(f"{self.layer_name}.latent", latent)
         iq, ik, igate, iw = self.indexer.project(x, q_c)
         P = T // kp
+        # Score against the keys as STORED: decode reads them back from the page at the
+        # page dtype, so rounding here too keeps a decode step and a one-shot prefill
+        # selecting from identical keys. A no-op in fp32.
         pool_k = kpool_compress(ik.view(1, P, kp, -1), igate.view(1, P, kp, -1),
-                                self.indexer.index_kpool_compress_ape)
+                                self.indexer.index_kpool_compress_ape).to(self.pages.dtype)
         scores = self.indexer.score(iq, iw, pool_k)
         lens = torch.arange(T, device=x.device) + 1
         mask = indices_to_mask(self.indexer.select(scores, lens).long(), T)
