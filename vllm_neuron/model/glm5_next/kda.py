@@ -207,8 +207,11 @@ def strictly_lower_inverse(a: torch.Tensor, size: int) -> torch.Tensor:
     inv = torch.eye(size, dtype=a.dtype, device=a.device).repeat(*a.shape[:-2], 1, 1)
     width = 1
     while width < size:
-        quadrant = ((rows // (2 * width) == cols // (2 * width))
-                    & (rows // width % 2 == 1) & (cols // width % 2 == 0))
+        # truncating division and fmod on these non-negative aranges: floor division and
+        # remainder on int64 lower through float64 under torch_xla (NCC_ESPP004)
+        rb, cb = torch.div(rows, width, rounding_mode="trunc"), torch.div(cols, width, rounding_mode="trunc")
+        quadrant = ((torch.div(rb, 2, rounding_mode="trunc") == torch.div(cb, 2, rounding_mode="trunc"))
+                    & (torch.fmod(rb, 2) == 1) & (torch.fmod(cb, 2) == 0))
         mask = quadrant.to(a.dtype).reshape(*lead, size, size)
         inv = inv + mask * (inv @ a @ inv)
         width *= 2
