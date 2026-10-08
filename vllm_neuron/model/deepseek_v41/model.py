@@ -133,8 +133,10 @@ def rope_cos_sin(freqs: torch.Tensor, pos: torch.Tensor):
     """``pos`` any integer shape -> cos, sin of shape ``pos.shape + [dim/2]``, fp32.
 
     The angle is ``float32(pos) * freq``, as the reference's ``torch.outer`` computes it.
+    ``freqs`` must already be on ``pos``'s device: a ``.to(device)`` inside a compiled
+    Neuron graph is an unimplemented cross-device copy.
     """
-    ang = pos.to(torch.float32).unsqueeze(-1) * freqs.to(pos.device)
+    ang = pos.to(torch.float32).unsqueeze(-1) * freqs
     return torch.cos(ang), torch.sin(ang)
 
 
