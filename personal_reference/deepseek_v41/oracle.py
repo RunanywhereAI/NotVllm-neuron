@@ -60,15 +60,16 @@ def fix_stale_index_keys(model, m) -> None:
         ix.forward = forward
 
 
-def build(m, args, init=None, fix_reference_bug: bool = True):
+def build(m, args, init=None, fix_reference_bug: bool = True, tokenizer=None):
     """Construct ``m.Transformer(args)`` in the precision of the loaded mode.
 
     ``init`` (optional) fills weights before the fp32 upcast. Faithful mode keeps the
-    reference's bf16 activations.
+    reference's bf16 activations. ``tokenizer`` feeds Engram's n-gram token map and is
+    required whenever the config has Engram layers.
     """
     exact = kernel_torch.get_mode() == "exact"
     torch.set_default_dtype(torch.float32 if exact else torch.bfloat16)
-    model = m.Transformer(args)
+    model = m.Transformer(args, tokenizer)
     if init is not None:
         init(model)
     if exact:
