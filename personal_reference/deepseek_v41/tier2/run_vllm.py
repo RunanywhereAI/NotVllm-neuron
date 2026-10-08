@@ -53,6 +53,7 @@ def main(tiny_dir: str, tp: int = 1, new_tokens: int = 12) -> int:
         dtype="float32",
         max_model_len=2048,
         max_num_seqs=2,
+        block_size=32,                   # the device layout: window block 32
         tensor_parallel_size=tp,
         enable_prefix_caching=True,
         max_num_batched_tokens=1024,     # APC needs segmented prefill: a supported size below max_model_len
