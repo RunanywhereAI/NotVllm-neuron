@@ -504,6 +504,13 @@ class Glm5NextForCausalLM(nn.Module):
     # page-major view and reserves a zero page and a write sink. See
     # ``initialize_kv_cache``.
     kv_cache_page_major = True
+    # One raw KV buffer per layer instead of one shared across groups (runner 152f21b).
+    # KDA state and MLA latent pages of different groups are typed views of one buffer,
+    # all written in the same compiled step: two aliased graph inputs, which on device
+    # can let one view's copy-back clobber the other's writes (suspected from DeepSeek's
+    # 6-35% device-vs-CPU logit gap). The compiler already budgets every view as its own
+    # input -- the 12.25 GB full-depth prefill estimate counted 45 separate page tensors.
+    kv_cache_unshared = True
 
     def __init__(self, config, tp_group=None, expert_layout: ExpertLayout | None = None):
         """``tp_group``: vLLM's ``GroupCoordinator`` for the TP group (``world_size``,
