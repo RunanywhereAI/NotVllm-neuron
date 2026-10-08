@@ -82,13 +82,19 @@ class EngramHasher:
     def __call__(self, tokens, start: int, count: int) -> torch.Tensor:
         """Hash rows for positions ``start .. start+count-1`` of the sequence ``tokens``
         (raw ids, at least ``start + count`` long)."""
-        ids = self.token_map[torch.as_tensor(tokens, dtype=torch.int64)]
+        ids = torch.as_tensor(tokens, dtype=torch.int64)
         pos = torch.arange(start, start + count)
-        cols, blocked = [], torch.zeros(count, dtype=torch.bool)
+        window = ids[(pos.unsqueeze(1) - torch.arange(self.n)).clamp_min(0)]
+        return self.hash_windows(window, pos)
+
+    def hash_windows(self, window: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """``window [T, n]``: raw ids at positions ``p, p-1, .., p-n+1`` (any value where
+        that is negative); ``pos [T]``: ``p``. -> ``[T, n_layers, cols]`` int64."""
+        ids = self.token_map[window.to(torch.int64)]
+        cols, blocked = [], torch.zeros(pos.shape[0], dtype=torch.bool)
         for shift in range(self.n):
             blocked = blocked | (pos < shift)
-            src = ids[(pos - shift).clamp_min(0)]
-            cols.append(torch.where(blocked, torch.full_like(src, self.pad), src))
+            cols.append(torch.where(blocked, torch.full_like(ids[:, shift], self.pad), ids[:, shift]))
         toks = torch.stack(cols, dim=-1)                                     # [T, n]
         prod = toks.unsqueeze(1) * self.mult                                 # [T, L, n]
         rolling, out = prod[..., 0], []
@@ -96,3 +102,38 @@ class EngramHasher:
             rolling = torch.bitwise_xor(rolling, prod[..., i])
             out.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
         return torch.cat(out, dim=-1) + self.offsets
+
+
+def compressed_token_map(tokenizer) -> tuple[list[int], int]:
+    """The reference's ``build_compressed_token_map``: tokens that normalise alike share an
+    id, and the number of distinct ids seeds every hash multiplier. Needs the HF fast
+    tokenizer (its Rust backend decodes without clean-up, as training did)."""
+    from tokenizers import Regex, normalizers
+
+    sentinel = "\ue000"
+    normalizer = normalizers.Sequence([
+        normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
+        normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
+        normalizers.Strip(), normalizers.Replace(sentinel, " "),
+    ])
+    backend = tokenizer.backend_tokenizer
+    key_to_new: dict[str, int] = {}
+    lookup = [0] * len(tokenizer)
+    for token_id in range(len(tokenizer)):
+        text = backend.decode([token_id], skip_special_tokens=False)
+        if "\ufffd" in text:
+            key = backend.id_to_token(token_id)
+        else:
+            normalized = normalizer.normalize_str(text)
+            key = normalized if normalized else text
+        lookup[token_id] = key_to_new.setdefault(key, len(key_to_new))
+    return lookup, len(key_to_new)
+
+
+def hasher_for(args, model_dir) -> EngramHasher:
+    """The hasher for a checkpoint directory. Builds the token map from the tokenizer,
+    once per rank: a few seconds over 129k tokens."""
+    from transformers import AutoTokenizer
+
+    lookup, vocab = compressed_token_map(AutoTokenizer.from_pretrained(str(model_dir)))
+    return EngramHasher(args, lookup, vocab)
