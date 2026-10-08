@@ -340,11 +340,20 @@ def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor,
 
 @dataclasses.dataclass
 class Caches:
-    """The bound page views, plus flat row views of each width the model addresses."""
+    """The bound page views, plus flat row views of each width the model addresses.
+
+    Writes are queued and applied by ``flush`` as ONE ``write_cache_rows`` per buffer per
+    step. Several aliased writes into one bound buffer leave only the last in place under
+    the FX aliasing pass; the rest become full-buffer copies (scratch, and on device lost
+    or corrupted writes). Nothing in a step reads its own writes -- fresh values are
+    substituted -- so deferring them changes no result.
+    """
 
     lay: CacheLayout
     window: torch.Tensor       # [num_pages, window_page_elems] fp32
     comp: torch.Tensor         # [num_pages, comp_page_elems] model dtype
+    _w: list = dataclasses.field(default_factory=list)
+    _c: list = dataclasses.field(default_factory=list)
 
     @property
     def num_pages(self) -> int:
@@ -356,8 +365,8 @@ class Caches:
         return flat.index_select(0, rows.reshape(-1)).view(*rows.shape, -1)
 
     def write_window(self, field: int, page, tok, rows) -> None:
-        write_cache_rows(self.window, rows.reshape(-1, self.lay.head_dim).float(),
-                         self.lay.window_row(page, tok, field).reshape(-1))
+        self._w.append((rows.reshape(-1, self.lay.head_dim).float(),
+                        self.lay.window_row(page, tok, field).reshape(-1)))
 
     def read_comp(self, source: int, page, entry, index: bool) -> torch.Tensor:
         lay = self.lay
@@ -369,12 +378,26 @@ class Caches:
         return flat.index_select(0, rows.reshape(-1)).view(*rows.shape, width)
 
     def write_comp(self, source: int, page, entry, rows, index: bool) -> None:
+        """Queued in index_head_dim-wide units: a latent row is head_dim/index_head_dim of
+        them, so every compressed write shares one width and one flush."""
         lay = self.lay
+        u = lay.index_head_dim
         if index:
-            ids, width = lay.index_row(source, page, entry), lay.index_head_dim
-        else:
-            ids, width = lay.latent_row(source, page, entry), lay.head_dim
-        write_cache_rows(self.comp, rows.reshape(-1, width), ids.reshape(-1))
+            ids = lay.index_row(source, page, entry).reshape(-1)
+            self._c.append((rows.reshape(-1, u), ids))
+            return
+        k = lay.head_dim // u
+        ids = lay.latent_row(source, page, entry).reshape(-1, 1) * k + torch.arange(k, device=page.device)
+        self._c.append((rows.reshape(-1, u), ids.reshape(-1)))
+
+    def flush(self) -> None:
+        if self._w:
+            write_cache_rows(self.window, torch.cat([r for r, _ in self._w]),
+                             torch.cat([i for _, i in self._w]))
+        if self._c:
+            write_cache_rows(self.comp, torch.cat([r.to(self.comp.dtype) for r, _ in self._c]),
+                             torch.cat([i for _, i in self._c]))
+        self._w, self._c = [], []
 
 
 def _substitute(gathered: torch.Tensor, fresh: torch.Tensor, j0: torch.Tensor,
@@ -1024,6 +1047,7 @@ class DeepseekV41Model(nn.Module):
             if layer.engram is not None:
                 ids = engram_ids[:, :, self.engram_index[layer.layer_id]]
             h, pre_mix = layer(h, pre_mix, step, caches, shared, ids)
+        caches.flush()
         h = Block.hc_pre(h, pre_mix)
         return self.norm(h).view(n * T, -1)
 
