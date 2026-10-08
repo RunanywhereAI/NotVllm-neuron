@@ -778,7 +778,10 @@ class Engram(nn.Module):
         hf = h.float()
         rstd = torch.rsqrt(hf.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
         dot = (hf * weight * key).sum(-1) * rstd * self.dim ** -0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        # signed sqrt; a select rather than torch.copysign, which lowers to a custom call
+        # neuronx-cc rejects (differs only at dot == -0.0)
+        root = dot.abs().clamp_min(1e-6).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -root, root))
         return (hf + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(h.dtype)
 
 
