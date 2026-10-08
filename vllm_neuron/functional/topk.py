@@ -6,6 +6,7 @@ This module provides a distributed topk operation that works across
 sharded tensors in a tensor-parallel setting.
 """
 
+import os
 import logging
 
 import torch
@@ -40,7 +41,11 @@ logger = logging.getLogger(__name__)
 # (``_get_rotational_topk_config``) MUST use the same value so the gate evaluates
 # the exact config the real run will build; keep it as one source of truth here.
 # (The kernel forces n_prgs to 1 internally when BxS == 1.)
-_ROTATIONAL_TOPK_NUM_PROGRAMS = 2
+# VLLM_NEURON_NKI_LNC_SPLIT=0 runs the kernel on one physical core. An NKI kernel split
+# across both cores of an LNC=2 logical core faulted with "vector DGE out-of-bound
+# access" inside large served graphs while testing clean alone (Kiln's notes; our
+# DeepSeek-V4.1 prefill).
+_ROTATIONAL_TOPK_NUM_PROGRAMS = 1 if os.environ.get("VLLM_NEURON_NKI_LNC_SPLIT", "1") == "0" else 2
 
 
 # Common NKI top-k selection seam.
