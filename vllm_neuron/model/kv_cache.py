@@ -88,6 +88,35 @@ class LatentLayerSpec:
 
 
 @dataclass
+class PagedLayerSpec:
+    """A pseudo-layer whose page content the model lays out itself.
+
+    For models whose per-token state fits neither a K/V pair nor one latent, such as
+    DeepSeek-V4.1, which keeps a sliding window of raw K and compressor state plus a
+    full-length store of compressed entries. The runner allocates whole pages and
+    binds one ``[num_pages, page_elems]`` view; the model owns every offset inside.
+
+    ``sliding_window`` set makes it a sliding-window group, so vLLM frees blocks that
+    leave the window. ``None`` makes it a full-attention group. Every paged layer of a
+    model must report the same ``block_size * page_elems * itemsize``: vLLM 0.24.0
+    requires one page size across groups, though block sizes may differ.
+
+    Attributes:
+        name: Layer name, the key of this group's ``attn_metadata`` and cache tensor.
+        block_size: Tokens per block for this group.
+        page_elems: Elements per page, at ``dtype``.
+        dtype: Element type of the page view.
+        sliding_window: Window in tokens, or None for a full-length group.
+    """
+
+    name: str
+    block_size: int
+    page_elems: int
+    dtype: torch.dtype
+    sliding_window: int | None = None
+
+
+@dataclass
 class KVSpec:
     """
     Defines the KV cache needs of a model by specifying all layer configurations.
@@ -99,6 +128,7 @@ class KVSpec:
     layers: list[LayerSpec]
     recurrent_layers: list[RecurrentLayerSpec] = field(default_factory=list)
     latent_layers: list[LatentLayerSpec] = field(default_factory=list)
+    paged_layers: list[PagedLayerSpec] = field(default_factory=list)
 
 
 def reserved_pages(num_pages: int) -> tuple[int, int]:
