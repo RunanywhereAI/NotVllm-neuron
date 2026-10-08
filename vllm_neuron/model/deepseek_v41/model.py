@@ -401,6 +401,8 @@ class Compressor(nn.Module):
 class Indexer(nn.Module):
     """Scores compressed positions and keeps the best ``index_topk`` per query."""
 
+    query_chunk = 128
+
     def __init__(self, args, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
@@ -439,8 +441,13 @@ class Indexer(nn.Module):
         lens = (step.pos + 1).div(r, rounding_mode="floor")                  # [n, T]
         reach = torch.arange(N, device=x.device) < lens.unsqueeze(-1)       # [n, T, N]
         k = torch.where(reach.any(dim=1).unsqueeze(-1), k, torch.zeros_like(k)).float()
-        score = torch.einsum("nthd,nmd->nthm", q.float(), k).relu()
-        score = (score * w.unsqueeze(-1)).sum(dim=2)
+        # per-head scores are [T, heads, N] before the head reduction: bound that by
+        # taking the queries a chunk at a time (a static, unrolled loop)
+        qf, chunks = q.float(), []
+        for t0 in range(0, T, self.query_chunk):
+            s = torch.einsum("nthd,nmd->nthm", qf[:, t0:t0 + self.query_chunk], k).relu()
+            chunks.append((s * w[:, t0:t0 + self.query_chunk].unsqueeze(-1)).sum(dim=2))
+        score = torch.cat(chunks, dim=1) if len(chunks) > 1 else chunks[0]
         score = score.masked_fill(~reach, float("-inf"))
         if self.is_candidate_source:
             shared["candidates"] = select_candidate_blocks(
