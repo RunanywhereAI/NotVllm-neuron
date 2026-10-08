@@ -70,7 +70,7 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
 from .cache_layout import latent_page_bytes
 from .kda import Glm5NextKDA
-from .mla import Glm5NextSparseMLA, _topk_indices
+from .mla import Glm5NextSparseMLA, _idiv, _topk_indices
 
 try:
     from vllm_neuron.accuracy.tensor_capture import capture_tensor as _capture_tensor
@@ -284,6 +284,7 @@ class Glm5NextMoE(nn.Module):
         self.layout, self.limit, self.top_k = layout, limit, top_k
         self.E, self.E_local = n_experts, n_experts // layout.ep_degree
         self.e0 = layout.first_local_expert(n_experts)
+        self.etp = layout.tp_degree
         self.I_tp = moe_intermediate_size // layout.tp_degree
         self.gate = Glm5NextRouter(n_experts, hidden_size, top_k,
                                    routed_scaling_factor, norm_topk_prob)
@@ -327,18 +328,23 @@ class Glm5NextMoE(nn.Module):
             skip_token=True, is_tensor_update_accumulating=True,
             compute_dtype=nl.bfloat16, **self._nf_clamps())
 
-    def _routed_nf_decode(self, x, routing, idx):
+    def _routed_nf_decode(self, x, routing, idx, rank=None):
         from nkilib.core.moe.moe_cte.moe_cte import ActFnType, ExpertAffinityScaleMode
 
         from vllm_neuron import functional as NF
 
         all_expert = self.layout.ep_degree > 1
+        if not all_expert:
+            rank_id = None
+        elif rank is None:
+            rank_id = torch.tensor([[self.layout.ep_rank]], dtype=torch.int32, device=x.device)
+        else:
+            rank_id = self._ep_rank(rank).reshape(1, 1).to(torch.int32)
         return NF.moe_tkg(
             hidden_input=x, expert_gate_up_weights=self.gate_up_proj,
             expert_down_weights=self.down_proj, expert_affinities=routing.to(x.dtype),
             expert_index=idx.to(torch.int32), is_all_expert=all_expert,
-            rank_id=(torch.tensor([[self.layout.ep_rank]], dtype=torch.int32,
-                                  device=x.device) if all_expert else None),
+            rank_id=rank_id,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
             activation_fn=ActFnType.SiLU, **self._nf_clamps())
 
@@ -368,18 +374,35 @@ class Glm5NextMoE(nn.Module):
             return "dense"
         if is_decode:
             return "nf_decode"
+        if self.etp > 1:
+            # The blockwise mapping gathers over the EP-TP row group (moe_blockwise.py:
+            # moe_group.all_gather), and every row is a different process group with a
+            # different name in the graph: one graph -- one compile -- per EP row, which
+            # is what exhausted host RAM at 64 ranks. The dense sum needs no group
+            # collective (the decoder's all-reduce adds the partials), so it is one graph.
+            return "dense"
         return "nf_prefill" if self.I_tp >= 128 else "dense"
+
+    def _ep_rank(self, rank: torch.Tensor) -> torch.Tensor:
+        """This rank's expert group from the runner's rank TENSOR, so every rank traces
+        the same graph: the plugin's EP-TP rows are consecutive ranks
+        (``neuron_parallel_state._build_ep_group_ranks``), hence ``rank // expert-TP``."""
+        return _idiv(rank.to(torch.long).reshape(()), self.etp)
 
     def forward(self, x, is_decode: bool = False, real=None, rank=None):
         routing, idx = self.gate(x)                                       # [T, E], [T, k]
-        local = routing.narrow(1, self.e0, self.E_local)
+        if rank is None:          # CPU harnesses: the layout's static coordinates
+            local = routing.narrow(1, self.e0, self.E_local)
+        else:                     # traced: no rank-dependent constant in the graph
+            ids = self._ep_rank(rank) * self.E_local + torch.arange(self.E_local, device=x.device)
+            local = routing.index_select(1, ids)
         impl = self._impl(x, is_decode)
         if impl == "dense":
             routed = self._routed_dense(x, local)
         elif impl == "nf_prefill":
             routed = self._routed_nf_prefill(x, local, real, rank)
         else:
-            routed = self._routed_nf_decode(x, routing, idx)
+            routed = self._routed_nf_decode(x, routing, idx, rank)
         return routed + self.shared_experts(x)
 
 
