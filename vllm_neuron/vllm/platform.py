@@ -193,6 +193,18 @@ class NeuronPlatform(Platform):
             "vllm_neuron.model.glm5_next:Glm5NextForConditionalGeneration",
         )
 
+        # DeepSeek-V4.1-Flash: vLLM 0.24.0 knows deepseek_v4 but neither the
+        # deepseek_v41 config class (transformers 5.x has none either) nor the
+        # architecture. The config must be registered before ModelConfig parses
+        # config.json; the model, before ModelConfig validates the architecture.
+        from vllm_neuron.model.deepseek_v41.config import register_with_vllm
+
+        register_with_vllm()
+        ModelRegistry.register_model(
+            "DeepseekV41ForCausalLM",
+            "vllm_neuron.model.deepseek_v41:DeepseekV41ForCausalLM",
+        )
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         """Default block_size to 32 for Neuron when the user didn't override."""
