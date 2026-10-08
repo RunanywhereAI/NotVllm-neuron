@@ -897,7 +897,13 @@ class DeepseekV41Model(nn.Module):
                              f"layout ({lay.window_page_elems}, {lay.comp_page_elems})")
         if w.dtype != torch.float32 or c.dtype != lay.comp_dtype or w.shape[0] != c.shape[0]:
             raise ValueError("window pages must be float32 and both views must cover one buffer")
-        self.caches = Caches(lay, w, c)
+        # plain tensor attributes, as llama binds k_cache: the runner's graph-capture
+        # trace swaps those for meta tensors, and would miss tensors inside a dataclass
+        self.window_pages, self.comp_pages = w, c
+
+    @property
+    def caches(self) -> Caches:
+        return Caches(self.layout, self.window_pages, self.comp_pages)
 
     # -- forward -------------------------------------------------------------------------
     def embed_tokens(self, ids: torch.Tensor, rank: torch.Tensor | None = None) -> torch.Tensor:
@@ -920,10 +926,11 @@ class DeepseekV41Model(nn.Module):
         computed on the host (``engram.EngramHasher``): the hash needs exact 64-bit
         integer arithmetic.
         """
-        if not hasattr(self, "caches"):
+        if getattr(self, "window_pages", None) is None:
             raise RuntimeError("bind_kv_cache() has not been called")
         rank = self._rank(rank, input_ids.device)
-        step = build_step(self.layout, self.caches.num_pages, positions, attn_metadata, rank)
+        caches = self.caches
+        step = build_step(self.layout, caches.num_pages, positions, attn_metadata, rank)
         n, T = step.n, step.T
         h = self.embed_tokens(input_ids.view(n, T), rank)
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
@@ -938,7 +945,7 @@ class DeepseekV41Model(nn.Module):
             ids = None
             if layer.engram is not None:
                 ids = engram_ids[:, :, self.engram_index[layer.layer_id]]
-            h, pre_mix = layer(h, pre_mix, step, self.caches, shared, ids)
+            h, pre_mix = layer(h, pre_mix, step, caches, shared, ids)
         h = Block.hc_pre(h, pre_mix)
         return self.norm(h).view(n * T, -1)
 
