@@ -124,7 +124,7 @@ def make(out: str):
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     torch.manual_seed(5)
     prompts = []
-    for L in (5, 20, 37, 70):
+    for L in (5, 20, 37, 600):   # 600 > the 512 bucket: a continuing segment
         p = torch.randint(2, 256, (L,)).tolist()
         ids = list(p)
         lps = []
@@ -144,10 +144,10 @@ def run(ckpt: str, tp: int):
     from vllm import LLM, SamplingParams
 
     ref = json.loads((pathlib.Path(ckpt) / "oracle_reference.json").read_text())
-    llm = LLM(model=ckpt, skip_tokenizer_init=True, dtype="float32", max_model_len=128,
+    llm = LLM(model=ckpt, skip_tokenizer_init=True, dtype="float32", max_model_len=1024,
               max_num_seqs=4, tensor_parallel_size=tp, enable_expert_parallel=tp > 1,
               enable_prefix_caching=False, enforce_eager=True, max_logprobs=1, block_size=16,
-              max_num_batched_tokens=32,
+              max_num_batched_tokens=512,
               additional_config={"neuron_config": {"on_device_sampling_config": None, "ep_degree": tp}},
               async_scheduling=False, num_gpu_blocks_override=128)
     sp = SamplingParams(max_tokens=ref["new_tokens"], temperature=0.0, logprobs=1, ignore_eos=True,
