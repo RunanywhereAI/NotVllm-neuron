@@ -117,24 +117,31 @@ class RMSNorm(nn.Module):
 
 
 def fp8_le240(q: torch.Tensor, s: torch.Tensor, block: tuple[int, int]):
-    """Block FP8 (``q`` e4m3fn ``[..., N, K]``, ``s`` fp32 ``[..., N/bn, K/bk]``) -> the same
-    values with every block's ``|q| <= 240``: blocks above are halved, scale doubled."""
+    """Block FP8 (``q`` e4m3fn ``[..., N, K]``, ``s`` fp32 ``[..., ceil(N/bn), K/bk]``) -> the
+    same values with every block's ``|q| <= 240``: blocks above are halved, scale doubled.
+    ``N`` may be ragged (``kv_a_proj_with_mqa`` is 576 = 4.5 x 128 rows). Load time only."""
     bn, bk = block
     *lead, N, K = q.shape
-    qf = q.float().view(*lead, N // bn, bn, K // bk, bk)
-    big = qf.abs().amax(dim=(-3, -1)) > FP8_MAX                       # [..., N/bn, K/bk]
+    nb = -(-N // bn)
+    qf = F.pad(q.float(), (0, 0, 0, nb * bn - N)).view(*lead, nb, bn, K // bk, bk)
+    big = qf.abs().amax(dim=(-3, -1)) > FP8_MAX                       # [..., nb, K/bk]
     half = torch.where(big[..., :, None, :, None], qf * 0.5, qf)
-    q2 = half.to(torch.float8_e4m3fn).view(*lead, N, K)
+    q2 = half.reshape(*lead, nb * bn, K)[..., :N, :].to(torch.float8_e4m3fn)
     s2 = torch.where(big, s.float() * 2.0, s.float())
     return q2, s2
 
 
 def dequant_block(q: torch.Tensor, s: torch.Tensor, block: tuple[int, int], dtype) -> torch.Tensor:
-    """``q [..., N, K]`` e4m3fn x ``s [..., N/bn, K/bk]`` -> ``dtype``. In the graph: a
-    broadcast multiply over a blocked view; no gather, no repeat_interleave."""
+    """``q [..., N, K]`` e4m3fn x ``s [..., ceil(N/bn), K/bk]`` -> ``dtype``. In the graph: the
+    (small) scale is broadcast to rows with expand/reshape/slice, then one multiply over a
+    ``[N, K/bk, bk]`` view of the weight; no gather, no repeat_interleave."""
     bn, bk = block
     *lead, N, K = q.shape
-    w = q.to(dtype).view(*lead, N // bn, bn, K // bk, bk) * s.to(dtype)[..., :, None, :, None]
+    nb, kb = s.shape[-2:]
+    if K != kb * bk or nb != -(-N // bn):
+        raise ValueError(f"scale {tuple(s.shape)} does not tile weight {(N, K)} in {block} blocks")
+    rows = s.to(dtype).unsqueeze(-2).expand(*lead, nb, bn, kb).reshape(*lead, nb * bn, kb)[..., :N, :]
+    w = q.to(dtype).view(*lead, N, kb, bk) * rows.unsqueeze(-1)
     return w.view(*lead, N, K)
 
 
