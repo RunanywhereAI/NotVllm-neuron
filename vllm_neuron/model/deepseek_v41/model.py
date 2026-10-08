@@ -52,6 +52,23 @@ except ImportError:  # pragma: no cover - hosts without vLLM
     def _capture_tensor(name, tensor):  # type: ignore[misc]
         return None
 
+try:
+    from vllm_neuron.functional.topk import topk as _nf_topk
+except ImportError:  # pragma: no cover - hosts without nki (the oracle laptop)
+    _nf_topk = None
+
+
+def topk_indices(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Indices of the ``k`` largest along the last dim.
+
+    ``torch.topk`` lowers to an HLO sort, which trn2 rejects (NCC_EVRF029); the plugin's
+    rotational NKI top-k compiles at every V4.1 shape (6 of 384, 512 of up to 131k, 2048
+    of 16k blocks) and falls back to ``torch.topk`` off device.
+    """
+    if _nf_topk is None:
+        return x.topk(k, dim=-1).indices
+    return _nf_topk(x, k, dim=-1, gather_dim=-1)[1].to(torch.long)
+
 
 # ------------------------------------------------------------------------- basic ops
 class RMSNorm(nn.Module):
@@ -194,8 +211,9 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
     num_blocks = scores.size(-1)
     last = (compress_lens - 1) // block_size
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
+    top = topk_indices(scores, min(topk_blocks, num_blocks))
+    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        -1, top, scores.gather(-1, top) > -torch.inf)
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
@@ -456,7 +474,7 @@ class Indexer(nn.Module):
                 score, lens.unsqueeze(-1), self.candidate_topk_blocks, self.candidate_block_size)
         elif self.uses_candidates:
             score = score.masked_fill(~shared["candidates"], float("-inf"))
-        idx = score.topk(min(self.index_topk, N), dim=-1).indices
+        idx = topk_indices(score, min(self.index_topk, N))
         _capture_tensor(f"layers.{self.layer_id}.indexer.topk", idx)
         return idx, idx < lens.unsqueeze(-1)
 
@@ -624,7 +642,7 @@ class Gate(nn.Module):
             scores = scores.sigmoid()
         else:
             scores = F.softplus(scores).sqrt()
-        idx = (scores + self.bias.float()).topk(self.topk, dim=-1).indices
+        idx = topk_indices(scores + self.bias.float(), self.topk)
         w = scores.gather(1, idx)
         if self.norm_topk_prob and self.topk > 1:
             w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
