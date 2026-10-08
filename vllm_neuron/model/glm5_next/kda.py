@@ -184,6 +184,37 @@ def _last_real_columns(x: torch.Tensor, real: torch.Tensor, count: int) -> torch
     return torch.einsum("bcl,bjl->bcj", x, sel)
 
 
+def strictly_lower_inverse(a: torch.Tensor, size: int) -> torch.Tensor:
+    """``(I - A)^-1`` for strictly lower-triangular ``A``, in ``log2(size)`` steps.
+
+    Taken from ``qwen3_5/deltanet.py::_strictly_lower_inverse`` (PR #54), which cannot
+    be imported here: that module imports vLLM at module scope and this one must stay
+    loadable on a laptop. Same sign convention -- ``A`` is the already-negated, masked
+    operator -- so it replaces FLA's scalar forward substitution
+    (``attn[..., i, :i] = ...`` for i in 1..size-1) exactly: that loop solves
+    ``X = A + A X`` row by row, i.e. ``X + I = (I - A)^-1``.
+
+    Why not the loop: each in-place slice assignment lowers to an XLA ``unselect``,
+    which libtorch-neuronx-lite fails to lower (``Error while lowering: xla::unselect``,
+    hit by GLM Tier 3 CPU compilation, 2026-10-08), and 63 dependent steps is a poor
+    shape for the compiler anyway. Blocked elimination keeps every intermediate a true
+    inverse of a sub-problem, so nothing grows (the Neumann product does not: deltanet
+    measured 0.57 absolute error with it).
+    """
+    lead = (1,) * (a.dim() - 2)
+    rows = torch.arange(size, device=a.device).reshape(size, 1)
+    cols = torch.arange(size, device=a.device).reshape(1, size)
+    inv = torch.eye(size, dtype=a.dtype, device=a.device).repeat(*a.shape[:-2], 1, 1)
+    width = 1
+    while width < size:
+        quadrant = ((rows // (2 * width) == cols // (2 * width))
+                    & (rows // width % 2 == 1) & (cols // width % 2 == 0))
+        mask = quadrant.to(a.dtype).reshape(*lead, size, size)
+        inv = inv + mask * (inv @ a @ inv)
+        width *= 2
+    return inv
+
+
 def recurrent_step(q, k, v, g, beta, state):
     """One token. q,k,v: [B,1,H,K]; g: [B,1,H,K]; beta: [B,1,H]; state: [B,H,K,V] fp32.
 
@@ -228,26 +259,25 @@ def chunk_prefill(q, k, v, g, beta, state=None, chunk: int = 64):
     decay = (g.unsqueeze(-2) - g.unsqueeze(-3)).masked_fill(stri[..., None], float("-inf")).exp()
     # TRAP 3a: the A operator masks j >= i, keeping j < i STRICTLY.
     attn = -(k_beta.unsqueeze(-2) * k.unsqueeze(-3) * decay).sum(-1).masked_fill(tri, 0)
-    for i in range(1, chunk):
-        row, sub = attn[..., i, :i].clone(), attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk, device=q.device)
+    # (I - A)^-1 by blocked elimination, not FLA's in-place forward substitution:
+    # the slice assignments do not lower on Neuron (see strictly_lower_inverse).
+    attn = strictly_lower_inverse(attn, chunk)
     v = attn @ v_beta
     # TRAP 2: exp(cg) is per channel, so it goes INSIDE the contraction.
     k_cumdecay = attn @ (k_beta * g.exp())
 
     S = torch.zeros(B, H, K, V, device=q.device) if state is None else state.float()
-    out = torch.zeros_like(v)
+    outs = []          # stacked after the loop: no in-place slice writes (see above)
     for i in range(Tp // chunk):
         q_i, k_i, v_i, g_i = q[:, :, i], k[:, :, i], v[:, :, i], g[:, :, i]
         inter = (q_i * g_i.exp()) @ S                        # TRAP 2 again
         # TRAP 3b: the intra output masks j > i, keeping j <= i INCLUSIVE.
         intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay[:, :, i]).sum(-1).masked_fill(stri, 0)
         v_new = v_i - k_cumdecay[:, :, i] @ S
-        out[:, :, i] = inter + intra @ v_new
+        outs.append(inter + intra @ v_new)
         S = S * g_i[:, :, -1].exp().unsqueeze(-1) + (
             k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
-    out = out.reshape(B, H, -1, V)[:, :, :T].transpose(1, 2).contiguous().to(dt)
+    out = torch.stack(outs, 2).reshape(B, H, -1, V)[:, :, :T].transpose(1, 2).contiguous().to(dt)
     return out, S
 
 
@@ -373,8 +403,9 @@ class Glm5NextKDA(nn.Module):
         qkv, g, beta, gate = self._project(hidden_states)
         # torch.roll allocates, so the advanced window must be returned, never assumed
         # to have been mutated in place.
-        conv_state = torch.roll(conv_state, -1, -1)
-        conv_state[..., -1] = qkv[..., 0]
+        # Shift in the new column out of place: a slice assignment lowers to an XLA
+        # unselect that does not lower on Neuron (see strictly_lower_inverse).
+        conv_state = torch.cat([conv_state[..., 1:], qkv.to(conv_state.dtype)], -1)
         qkv = F.silu((conv_state * self.conv1d.weight.squeeze(1)).sum(-1)).unsqueeze(-1)
         self._capture("conv_window", conv_state)
         q, k, v = (t.reshape(B, S, self.H, self.K)
