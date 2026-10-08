@@ -69,17 +69,23 @@ def plugin_from_reference(ref_model, args, block_size: int = 8, dtype=torch.floa
 class FakeRunner:
     """Block bookkeeping and per-group ``attn_metadata`` for the two pseudo-layers."""
 
-    def __init__(self, model, num_blocks: int = 256, max_model_len: int = 512):
+    def __init__(self, model, num_blocks: int = 256, max_model_len: int = 512, device=None,
+                 forward=None):
+        """``device``: where pages and inputs live (CPU by default). ``forward``: what runs
+        a step, ``(ids, pos, md, engram_ids) -> hidden``; ``model.hidden_states`` by
+        default, a compiled callable on device."""
         from vllm_neuron.model.deepseek_v41.cache_layout import COMPRESSED_LAYER, WINDOW_LAYER
 
         self.W, self.C = WINDOW_LAYER, COMPRESSED_LAYER
         self.model = model
+        self.device = device or torch.device("cpu")
+        self.forward = forward or (lambda i, p, m, e: model.hidden_states(i, p, m, engram_ids=e))
         spec = {s.name: s for s in model.get_kv_spec().paged_layers}
         self.spec = spec
         page = spec[self.W].page_elems * 4
         assert page == spec[self.C].page_elems * spec[self.C].dtype.itemsize
         self.num_pages = num_blocks + 2
-        raw = torch.full((self.num_pages * page,), -1, dtype=torch.int8)        # 0xFF
+        raw = torch.full((self.num_pages * page,), -1, dtype=torch.int8).to(self.device)  # 0xFF
         model.bind_kv_cache({
             self.W: [raw.view(torch.float32).view(self.num_pages, -1)],
             self.C: [raw.view(spec[self.C].dtype).view(self.num_pages, -1)],
@@ -130,8 +136,8 @@ class FakeRunner:
         ids = torch.tensor(list(tokens) + [tokens[-1]] * (bucket - n))
         if engram_ids is not None:
             engram_ids = torch.cat([engram_ids, engram_ids[-1:].expand(bucket - n, *engram_ids.shape[1:])])
-        h = self.model.hidden_states(ids, torch.tensor(pos), md, engram_ids=engram_ids)
-        return self.model.compute_logits(h)[:n]
+        h = self._run(ids, torch.tensor(pos), md, engram_ids)
+        return self.model.compute_logits(h).cpu()[:n]
 
     def _swa_blocks(self):
         bs, win = self.bs(self.W), self.spec[self.W].sliding_window
@@ -170,5 +176,11 @@ class FakeRunner:
         if engram_ids is not None:
             engram_ids = torch.cat([engram_ids, torch.zeros(pad_rows, *engram_ids.shape[1:],
                                                             dtype=engram_ids.dtype)])
-        h = self.model.hidden_states(ids, pos, md, engram_ids=engram_ids)
-        return self.model.compute_logits(h)[: len(reqs)]
+        h = self._run(ids, pos, md, engram_ids)
+        return self.model.compute_logits(h).cpu()[: len(reqs)]
+
+    def _run(self, ids, pos, md, engram_ids):
+        d = self.device
+        md = {g: {k: (v.to(d) if torch.is_tensor(v) else v) for k, v in m.items()} for g, m in md.items()}
+        e = None if engram_ids is None else engram_ids.to(d)
+        return self.forward(ids.to(d), pos.to(d), md, e)
