@@ -8,11 +8,17 @@
 # oracle covers a continuing chunk), so prefix caching is on and prompts longer than the
 # 512 bucket are prefilled in 512-token segments.
 #
-# KV: one page per 32 tokens holds all 78 layers (576-wide latent + 128-wide index key on
-# the 21 indexer layers) = 3.05 MB/page, replicated on every rank. BLOCKS=512 -> 1.56 GB,
-# 16K tokens in flight. Compile probe: personal_reference/glm_moe_dsa/tier3/compile_probe.py
+# KV: one buffer per layer (78), one page per 32 tokens = 576-wide latent + 128-wide index
+# key rows (+pad) = 46 KB/layer/page, 3.59 MB per block over all layers, replicated on every
+# rank. BLOCKS=1024 -> 3.4 GiB, 32K tokens in flight.
+# Compile probe (personal_reference/glm_moe_dsa/tier3/compile_probe.py, full depth,
+# T=512 prefill, n=16 decode, max_len 8192), compiler's total estimated HBM per core:
+#   512 blocks:  prefill 13.57 GB, decode 14.50 GB (scratch 0.3 / 1.3 GB)
+#   1024 blocks: see /data/logs/glm53_probe_pl8k1024.log
+# Decode scratch grows with SEQS x MAX_LEN (every request reads the whole addressable
+# context); 16 x 8192 is what was compiled.
 #
-#   MAX_LEN=8192 SEQS=16 BLOCKS=512 /data/serve_glm53.sh
+#   MAX_LEN=8192 SEQS=16 BLOCKS=1024 /data/serve_glm53.sh
 #
 # vLLM refuses an fp8 config.json on this platform before plugin code runs, so the model
 # is served from /data/glm53-served: config.json without quantization_config (kept as
@@ -20,7 +26,7 @@
 set -e
 MAX_LEN=${MAX_LEN:-8192}
 SEQS=${SEQS:-16}
-BLOCKS=${BLOCKS:-512}
+BLOCKS=${BLOCKS:-1024}
 BUCKET=${BUCKET:-512}
 export PYTHONPATH=/data/glm53-wt
 export PATH=/data/venv-fork/bin:$PATH
