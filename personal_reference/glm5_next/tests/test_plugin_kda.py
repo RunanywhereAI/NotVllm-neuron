@@ -226,6 +226,10 @@ def test_capture_points_fire_and_carry_tensors(monkeypatch):
     print(f"\n  capture points firing: {len(seen)} on decode, names {sorted(n.split('.')[-1] for n in seen)}")
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("vllm") is not None,
+    reason="checkable only where vLLM is absent: with it installed the layer's optional "
+           "imports legitimately pull it in")
 def test_layer_imports_without_vllm():
     """The property the whole validation route depends on. If the layer ever imports
     vLLM at module scope, none of the tests above can run on a laptop."""
