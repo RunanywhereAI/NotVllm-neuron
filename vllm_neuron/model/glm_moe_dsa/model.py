@@ -68,7 +68,6 @@ try:
 except ImportError:  # pragma: no cover - hosts without nki
     _nf_topk = None
 
-CACHE_LAYER = "glm_moe_dsa.cache"
 FP8_MAX = 240.0   # trn2 e4m3
 
 
@@ -215,44 +214,38 @@ def rope_interleave(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
 # ----------------------------------------------------------------------------- cache
 @dataclasses.dataclass(frozen=True)
 class CacheLayout:
-    """One page per ``block_size`` tokens holding every layer's rows for them.
+    """One buffer PER LAYER, one page per ``block_size`` tokens:
+    ``[latent rows (B x 576) | index-key rows (B x 128) | pad]``.
 
-    ``[layer 0 latent rows (B x 576) | ... | layer L-1 | index layer 0 keys (B x 128) |
-    ... | pad]``. The page is padded to a multiple of ``lcm(576, 128)`` so the flat buffer
-    viewed as 576-wide or 128-wide rows has every region on a row boundary.
+    Per layer, not one page holding every layer: the cache write is an aliased in-place
+    scatter, and the FX aliasing pass makes only the LAST write per buffer in place, so 99
+    writes into one shared buffer kept ~4 full copies of it as scratch (7.4 GB of the
+    first full-depth decode estimate, tracking the block count, not the context). Every
+    layer carries the index region, used or not, because vLLM needs one page size per
+    group. The page is padded to a multiple of ``lcm(576, 128, B)`` so the buffer viewed
+    as 576-wide or 128-wide rows puts both regions on row boundaries.
     """
 
     block_size: int
-    n_layers: int
     latent_dim: int
     index_dim: int
-    index_layers: tuple
     dtype: torch.dtype
 
     @property
-    def _unit(self) -> int:
-        import math
-        return math.lcm(self.latent_dim, self.index_dim)
-
-    @property
-    def latent_elems(self) -> int:
-        return self.n_layers * self.block_size * self.latent_dim
-
-    @property
     def page_elems(self) -> int:
-        raw = self.latent_elems + len(self.index_layers) * self.block_size * self.index_dim
-        u = self._unit
-        # also a multiple of block_size: the runner sizes one vector per token
         import math
-        u = math.lcm(u, self.block_size)
+        B = self.block_size
+        if (B * self.latent_dim) % self.index_dim:
+            raise ValueError(f"block_size {B} puts the index region off a {self.index_dim}-row boundary")
+        raw = B * (self.latent_dim + self.index_dim)
+        u = math.lcm(self.latent_dim, self.index_dim, B)
         return -(-raw // u) * u
 
-    def latent_row(self, layer: int, page: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        return page * (self.page_elems // self.latent_dim) + layer * self.block_size + tok
+    def latent_row(self, page: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        return page * (self.page_elems // self.latent_dim) + tok
 
-    def index_row(self, layer: int, page: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        j = self.index_layers.index(layer)
-        base = self.latent_elems // self.index_dim + j * self.block_size
+    def index_row(self, page: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        base = self.block_size * self.latent_dim // self.index_dim
         return page * (self.page_elems // self.index_dim) + base + tok
 
 
@@ -281,6 +274,7 @@ class Step:
 
 def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor, md: dict,
                inv_freq: torch.Tensor) -> Step:
+    """``md``: any one layer's ``attn_metadata`` entry (all layers share one group)."""
     decode = md["max_query_len"] <= md["decode_token_threshold"]
     zero_page, sink = reserved_pages(num_pages)
     bt = md["block_table_tensor"]
@@ -312,31 +306,29 @@ def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor, md: di
 
 
 @dataclasses.dataclass
-class Caches:
-    lay: CacheLayout
-    pages: torch.Tensor     # [num_pages, page_elems]
+class LayerCache:
+    """One layer's bound page view ``[num_pages, page_elems]`` and its layout."""
 
-    @property
-    def num_pages(self) -> int:
-        return self.pages.shape[0]
+    lay: CacheLayout
+    pages: torch.Tensor
 
     def _read(self, rows: torch.Tensor, width: int) -> torch.Tensor:
         flat = self.pages.view(-1, width)
         return flat.index_select(0, rows.reshape(-1)).view(*rows.shape, width)
 
-    def read_latent(self, layer, page, tok):
-        return self._read(self.lay.latent_row(layer, page, tok), self.lay.latent_dim)
+    def read_latent(self, page, tok):
+        return self._read(self.lay.latent_row(page, tok), self.lay.latent_dim)
 
-    def read_index(self, layer, page, tok):
-        return self._read(self.lay.index_row(layer, page, tok), self.lay.index_dim)
+    def read_index(self, page, tok):
+        return self._read(self.lay.index_row(page, tok), self.lay.index_dim)
 
-    def write_latent(self, layer, page, tok, rows):
+    def write_latent(self, page, tok, rows):
         write_cache_rows(self.pages, rows.reshape(-1, self.lay.latent_dim),
-                         self.lay.latent_row(layer, page, tok).reshape(-1))
+                         self.lay.latent_row(page, tok).reshape(-1))
 
-    def write_index(self, layer, page, tok, rows):
+    def write_index(self, page, tok, rows):
         write_cache_rows(self.pages, rows.reshape(-1, self.lay.index_dim),
-                         self.lay.index_row(layer, page, tok).reshape(-1))
+                         self.lay.index_row(page, tok).reshape(-1))
 
 
 def _substitute(gathered: torch.Tensor, fresh: torch.Tensor, j0: torch.Tensor,
@@ -373,7 +365,7 @@ class Indexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = Linear(args.dim, self.n_heads)
 
-    def forward(self, x, qr, step: Step, caches: Caches):
+    def forward(self, x, qr, step: Step, cache: LayerCache):
         n, T, _ = x.shape
         rd = self.rd
         cos, sin = step.cos, step.sin
@@ -382,8 +374,8 @@ class Indexer(nn.Module):
                        q[..., rd:]], dim=-1)
         k = self.k_norm(self.wk(x))
         k = torch.cat([rope_interleave(k[..., :rd], cos, sin), k[..., rd:]], dim=-1)
-        caches.write_index(self.layer_id, step.w_page, step.w_tok, k)
-        ctx = caches.read_index(self.layer_id, step.c_page, step.c_tok)
+        cache.write_index(step.w_page, step.w_tok, k)
+        ctx = cache.read_index(step.c_page, step.c_tok)
         ctx = _substitute(ctx, k, step.s, step.live)
         C = ctx.shape[1]
         if self.index_topk >= C:
@@ -430,7 +422,7 @@ class Attention(nn.Module):
         self.o_proj = Linear(self.n_heads * self.vd, args.dim)
         self.indexer = Indexer(args, layer_id, par) if args.indexer_types[layer_id] == "full" else None
 
-    def forward(self, x, step: Step, caches: Caches, shared: dict):
+    def forward(self, x, step: Step, lay: CacheLayout, shared: dict):
         n, T, _ = x.shape
         H = self.n_heads
         cos, sin = step.cos, step.sin
@@ -443,14 +435,17 @@ class Attention(nn.Module):
         lat = self.kv_a_layernorm(kv[..., : self.kvr])
         k_pe = rope_interleave(kv[..., self.kvr:], cos, sin)
         fresh = torch.cat([lat, k_pe], dim=-1)                             # [n, T, 576]
-        caches.write_latent(self.layer_id, step.w_page, step.w_tok, fresh)
-        ctx = caches.read_latent(self.layer_id, step.c_page, step.c_tok)
+        # ``self.pages``: a plain tensor attribute bound by ``bind_kv_cache`` (the runner's
+        # graph capture swaps those; it would miss one held in a dataclass)
+        cache = LayerCache(lay, self.pages)
+        cache.write_latent(step.w_page, step.w_tok, fresh)
+        ctx = cache.read_latent(step.c_page, step.c_tok)
         ctx = _substitute(ctx, fresh, step.s, step.live)
         # select, never multiply: an unwritten page may hold anything
         ctx = torch.where(step.used, ctx, torch.zeros_like(ctx)).float()  # [n, C, 576]
 
         if self.indexer is not None:
-            shared["mask"] = self.indexer(x, qr, step, caches)
+            shared["mask"] = self.indexer(x, qr, step, cache)
         mask = shared["mask"]                                              # [n, T, C]
 
         w = self.kv_b_proj.weight.float().view(H, self.nope + self.vd, self.kvr)
@@ -566,8 +561,8 @@ class Block(nn.Module):
         self.input_layernorm = RMSNorm(args.dim, args.norm_eps)
         self.post_attention_layernorm = RMSNorm(args.dim, args.norm_eps)
 
-    def forward(self, h, step, caches, shared, ep_rank):
-        a = self.self_attn(self.input_layernorm(h), step, caches, shared)
+    def forward(self, h, step, lay, shared, ep_rank):
+        a = self.self_attn(self.input_layernorm(h), step, lay, shared)
         h = h + self.par.all_reduce(a.float()).to(h.dtype)
         x = self.post_attention_layernorm(h)
         m = self.mlp(x, ep_rank) if self.is_moe else self.mlp(x).float()
@@ -601,9 +596,8 @@ class GlmMoeDsaModel(nn.Module):
         self.model.norm = RMSNorm(args.dim, args.norm_eps)
         self.lm_head = nn.Module()
         self.lm_head.weight = nn.Parameter(torch.zeros(self.vocab_local, args.dim))
-        self.layout = CacheLayout(block_size=block_size, n_layers=args.n_layers,
-                                  latent_dim=args.latent_dim, index_dim=args.index_head_dim,
-                                  index_layers=args.index_layers, dtype=cache_dtype)
+        self.layout = CacheLayout(block_size=block_size, latent_dim=args.latent_dim,
+                                  index_dim=args.index_head_dim, dtype=cache_dtype)
         self.register_buffer("inv_freq", rope_inv_freq(args.qk_rope_head_dim, args.rope_theta),
                              persistent=False)
 
@@ -618,20 +612,33 @@ class GlmMoeDsaModel(nn.Module):
         return self
 
     # -- caches ------------------------------------------------------------------------
+    @staticmethod
+    def cache_name(i: int) -> str:
+        return f"model.layers.{i}.self_attn"
+
     def get_kv_spec(self) -> KVSpec:
+        """One paged pseudo-layer per decoder layer, all with the same spec, so vLLM puts
+        them in ONE group (one block table) with one buffer each."""
         lay = self.layout
         return KVSpec(layers=[], paged_layers=[
-            PagedLayerSpec(name=CACHE_LAYER, block_size=lay.block_size,
-                           page_elems=lay.page_elems, dtype=lay.dtype)])
+            PagedLayerSpec(name=self.cache_name(i), block_size=lay.block_size,
+                           page_elems=lay.page_elems, dtype=lay.dtype)
+            for i in range(self.args.n_layers)])
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
-        (c,) = kv_caches[CACHE_LAYER]
         lay = self.layout
-        if c.shape[1:] != (lay.page_elems,) or c.dtype != lay.dtype:
-            raise ValueError(f"bound pages {tuple(c.shape)} {c.dtype} do not match the layout "
-                             f"({lay.page_elems}, {lay.dtype})")
-        # a plain tensor attribute: the runner's graph-capture trace swaps those
-        self.cache_pages = c
+        n_pages = None
+        for i, layer in enumerate(self.model.layers):
+            (c,) = kv_caches[self.cache_name(i)]
+            if c.shape[1:] != (lay.page_elems,) or c.dtype != lay.dtype:
+                raise ValueError(f"layer {i}: bound pages {tuple(c.shape)} {c.dtype} do not match "
+                                 f"the layout ({lay.page_elems}, {lay.dtype})")
+            if n_pages is not None and c.shape[0] != n_pages:
+                raise ValueError("every layer's buffer must hold the same pages")
+            n_pages = c.shape[0]
+            # a plain tensor attribute: the runner's graph-capture trace swaps those
+            layer.self_attn.pages = c
+        self.num_pages = n_pages
 
     # -- forward -------------------------------------------------------------------------
     def _rank(self, rank, device) -> torch.Tensor:
@@ -649,18 +656,17 @@ class GlmMoeDsaModel(nn.Module):
         return self.par.all_reduce(h)
 
     def hidden_states(self, input_ids, positions, attn_metadata, rank=None):
-        if getattr(self, "cache_pages", None) is None:
+        if getattr(self, "num_pages", None) is None:
             raise RuntimeError("bind_kv_cache() has not been called")
         rank = self._rank(rank, input_ids.device)
-        caches = Caches(self.layout, self.cache_pages)
-        step = build_step(self.layout, caches.num_pages, positions, attn_metadata[CACHE_LAYER],
+        step = build_step(self.layout, self.num_pages, positions, attn_metadata[self.cache_name(0)],
                           self.inv_freq)
         n, T = step.pos.shape
         h = self.embed_tokens(input_ids.view(n, T), rank)
         # routed experts are EP-only (etp == 1): the EP rank is the TP rank
         shared: dict = {}
         for layer in self.model.layers:
-            h = layer(h, step, caches, shared, rank)
+            h = layer(h, step, self.layout, shared, rank)
         return self.model.norm(h).view(n * T, -1)
 
     def compute_logits(self, hidden: torch.Tensor, gather: bool = True) -> torch.Tensor:
