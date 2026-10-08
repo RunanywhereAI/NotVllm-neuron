@@ -359,10 +359,14 @@ class Glm5NextMoE(nn.Module):
             return "nf_decode" if (is_decode and on_device) else "nf_prefill"
         if not on_device:
             return "dense"
+        # The kernels' shape limits, checked here because the plugin's own guards do
+        # not: nkilib moe_tkg asserts H % 128 == 0 at trace time
+        # (moe_tkg/mlp_parameters.py), and NF.moe_cte below I_TP 128 falls back to
+        # its own dense torch loop over every expert -- the reference with extra steps.
+        if self.gate_up_proj.shape[1] % 128:
+            return "dense"
         if is_decode:
             return "nf_decode"
-        # NF.moe_cte's kernel guard: below 128 it would fall back to its own dense
-        # torch loop over every expert, which is the reference path with extra steps
         return "nf_prefill" if self.I_tp >= 128 else "dense"
 
     def forward(self, x, is_decode: bool = False, real=None, rank=None):
@@ -654,6 +658,15 @@ class Glm5NextForCausalLM(nn.Module):
         from .config import Glm5NextConfig
 
         config = Glm5NextConfig.from_configs(hf_config, text_neuron_config=text_neuron_config)
+        # Serve at vLLM's resolved dtype, not the checkpoint's. ``--dtype`` may differ
+        # from the checkpoint, and the KV cache is allocated at the serving dtype; the
+        # runner refuses a latent page laid out at any other (found by Tier 3, where a
+        # float32 tiny checkpoint was served in bf16).
+        from vllm.config import get_current_vllm_config
+
+        current = get_current_vllm_config()
+        if current is not None and current.model_config is not None:
+            config.text_config.torch_dtype = current.model_config.dtype
         tp = get_tp_group()
         layout = None
         if getattr(text_neuron_config, "ep_degree", 1) > 1:
