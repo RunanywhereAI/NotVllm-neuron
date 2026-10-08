@@ -40,6 +40,12 @@ def main(ckpt: str, max_num_seqs: int) -> int:
         limit_mm_per_prompt={"image": 0, "video": 0},
         max_logprobs=1,
         additional_config={"neuron_config": {"on_device_sampling_config": None}},
+        # the runner refuses async execution without on-device sampling, and ODS is
+        # off so that logits come back and vLLM can report log-probabilities
+        async_scheduling=False,
+        # CPU mode otherwise sizes the cache from host RAM (~1e9 tokens, minutes of
+        # zero-fill); a few hundred blocks is far more than 4 x 128 tokens need
+        num_gpu_blocks_override=256,
     )
     sp = SamplingParams(max_tokens=ref["new_tokens"], temperature=0.0, logprobs=1,
                         ignore_eos=True, detokenize=False)
