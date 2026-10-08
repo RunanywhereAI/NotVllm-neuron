@@ -4,6 +4,7 @@ import os
 from .llama3 import LlamaForCausalLM
 from .glm5_next import Glm5NextForConditionalGeneration
 from .deepseek_v41 import DeepseekV41ForCausalLM
+from .glm_moe_dsa import GlmMoeDsaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
 from .qwen3 import Qwen3ForCausalLM
@@ -24,6 +25,7 @@ def get_models() -> list[tuple[str, type]]:
         ("LlamaForCausalLM", LlamaForCausalLM),
         ("Glm5NextForConditionalGeneration", Glm5NextForConditionalGeneration),
         ("DeepseekV41ForCausalLM", DeepseekV41ForCausalLM),
+        ("GlmMoeDsaForCausalLM", GlmMoeDsaForCausalLM),
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3ForCausalLM", Qwen3ForCausalLM),
