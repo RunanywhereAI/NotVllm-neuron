@@ -224,6 +224,10 @@ def test_capture_points_fire_and_carry_tensors(monkeypatch):
     print(f"\n  captured: {sorted(n.split(m.layer_name + '.')[-1] for n in seen)}")
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("vllm") is not None,
+    reason="checkable only where vLLM is absent: with it installed the layer's optional "
+           "imports legitimately pull it in")
 def test_layer_imports_without_vllm():
     assert "vllm" not in sys.modules
 
