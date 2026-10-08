@@ -75,7 +75,9 @@ def fusion_barrier(x: torch.Tensor, dim: int, anchor: torch.Tensor) -> torch.Ten
     ``arange + 0 * anchor`` with ``anchor`` derived from a graph input. Stops neuronx-cc
     fusing a strided producer into a consumer matmul, which tripped NCC_INIC901
     ("NeuronInstComb: Cannot delinearize") on the indexer's ``wk`` at prefill shapes."""
-    zero = (anchor.reshape(-1)[:1] * 0).to(torch.long)
+    # clamp, not ``* 0``: XLA folds an integer multiply by zero, and with it the barrier.
+    # The anchor is never negative, which the compiler cannot know.
+    zero = anchor.reshape(-1)[:1].to(torch.long).clamp(max=0)
     idx = torch.arange(x.shape[dim], device=x.device) + zero
     return x.index_select(dim, idx)
 
@@ -414,11 +416,11 @@ class Compressor(nn.Module):
             self.wgate = _linear(args.dim, args.head_dim)
 
     def forward(self, x, step: Step, caches: Caches):
-        """-> ``(latent [n, G, head_dim] before RoPE, j0 [n], valid [n, G])``."""
+        """-> ``(latent [n, G, head_dim] before its RMSNorm and RoPE, j0 [n], valid [n, G])``."""
         n, T, _ = x.shape
         r = self.ratio
         if r == 1:
-            return self.norm(self.wkv(x)), step.s, step.live
+            return self.wkv(x), step.s, step.live
         dtype = x.dtype
         xf = x.float()
         kv, score = F.linear(xf, self.wkv.weight.float()), F.linear(xf, self.wgate.weight.float())
@@ -455,7 +457,7 @@ class Compressor(nn.Module):
             j0 = _idiv(step.s, r)
         caches.write_window(f_kv, step.w_page, step.w_tok, kv)
         caches.write_window(f_sc, step.w_page, step.w_tok, score)
-        return self.norm(latent.to(dtype)), j0, valid
+        return latent.to(dtype), j0, valid
 
 
 class Indexer(nn.Module):
@@ -482,10 +484,14 @@ class Indexer(nn.Module):
             self.wk = _linear(args.head_dim, self.head_dim)
             self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
 
-    def keys(self, latent, cos, sin):
-        # fp32 projection (see Compressor.forward on NCC_INIC901); cast back after
-        k = F.linear(latent.float(), self.wk.weight.float()).to(latent.dtype)
-        return rope_tail(self.k_norm(k), cos, sin, self.rd)
+    def keys(self, raw, norm: RMSNorm, cos, sin):
+        """Index keys from the compressor's PRE-norm latent: ``wk(norm(raw))`` with the norm's
+        per-row scale applied after the matmul, ``((raw * w) @ wk^T) * rsqrt(mean(raw^2) + eps)``.
+        The same map; a row-scaled operand feeding this dot tripped NCC_INIC901."""
+        xr = raw.float()
+        scale = torch.rsqrt(xr.square().mean(-1, keepdim=True) + norm.eps)
+        k = F.linear(xr * norm.weight.float(), self.wk.weight.float()) * scale
+        return rope_tail(self.k_norm(k.to(raw.dtype)), cos, sin, self.rd)
 
     def forward(self, x, qr, cos, sin, step: Step, caches: Caches, shared: dict):
         n, T, _ = x.shape
@@ -570,12 +576,13 @@ class Attention(nn.Module):
         self.register_buffer("freqs", freqs, persistent=False)
 
     def _compress(self, x, step: Step, caches: Caches) -> Fresh:
-        latent, j0, valid = self.compressor(x, step, caches)
+        raw, j0, valid = self.compressor(x, step, caches)
+        latent = self.compressor.norm(raw)
         r = self.ratio
         G = latent.shape[1]
         jpos = (j0.view(-1, 1) + torch.arange(G, device=x.device)) * r     # group's first token
         cos, sin = rope_cos_sin(self.freqs, jpos)
-        index_k = self.indexer.keys(fusion_barrier(latent, 1, j0), cos, sin)
+        index_k = self.indexer.keys(fusion_barrier(raw, 1, j0), self.compressor.norm, cos, sin)
         latent = rope_tail(latent, cos, sin, self.rd)
         # address: the page and in-block entry of each group's first token
         if step.decode:
