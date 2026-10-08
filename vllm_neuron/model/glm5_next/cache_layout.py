@@ -52,6 +52,19 @@ from dataclasses import dataclass
 
 import torch
 
+
+def _idiv(x, d: int):
+    """``x // d`` for a NON-NEGATIVE tensor (or a Python int). Truncating division lowers
+    to an integer divide; floor division and ``remainder`` on an int64 tensor lower
+    through float64 under torch_xla, which neuronx-cc rejects (NCC_ESPP004). The two
+    agree for non-negative operands."""
+    return torch.div(x, d, rounding_mode="trunc") if isinstance(x, torch.Tensor) else x // d
+
+
+def _imod(x, d: int):
+    """``x % d`` for a NON-NEGATIVE tensor (or a Python int); see ``_idiv``."""
+    return torch.fmod(x, d) if isinstance(x, torch.Tensor) else x % d
+
 # Bytes of FP8 block scale stored inline per pool entry, from vLLM's own indexer cache:
 # ``head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4``
 # (``vllm/models/glm5next/common/attention.py``). These 4 bytes are the entire reason
@@ -278,7 +291,7 @@ class LatentPageLayout:
 
     def slot_to_page(self, slot: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """vLLM slot -> ``(page, token offset within the page)``."""
-        return slot // self.block_size, slot % self.block_size
+        return _idiv(slot, self.block_size), _imod(slot, self.block_size)
 
     def latent_row(self, page, token_in_page):
         """Row of one token's latent in the ``[-1, kv_lora_rank]`` view."""
@@ -293,7 +306,7 @@ class LatentPageLayout:
         self._rows_only()
         per_page = self.total_elems // self.index_head_dim
         return (page * per_page + self.indexer_elem_offset // self.index_head_dim
-                + token_in_page // self.index_kpool)
+                + _idiv(token_in_page, self.index_kpool))
 
     def tail_rows(self, page, token_in_page):
         """``(k_row, gate_row)`` of the tail slot ``token_in_page % index_kpool`` in the
@@ -301,7 +314,7 @@ class LatentPageLayout:
         self._rows_only()
         per_page = self.total_elems // self.index_head_dim
         base = (page * per_page + self.tail_elem_offset // self.index_head_dim
-                + 2 * (token_in_page % self.index_kpool))
+                + 2 * _imod(token_in_page, self.index_kpool))
         return base, base + 1
 
     def split(self, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
