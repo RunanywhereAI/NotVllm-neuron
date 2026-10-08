@@ -35,7 +35,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -384,6 +383,18 @@ def build_sampling_params_tensor(
 
 
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
+
+def _is_single_vector_spec(spec) -> bool:
+    """A spec whose page is one vector per token, bound as a single page view.
+
+    MLA's latent (no V half by definition), and attention specs declared with
+    ``head_size_v == 0`` -- how model-laid-out windowed pages (``PagedLayerSpec``)
+    reach vLLM without a K/V pair.
+    """
+    if isinstance(spec, MLAAttentionSpec):
+        return True
+    return isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)) and spec.head_size_v == 0
+
 class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunnerMixin):
     """
     Model runner that executes the NeuronModel with proper state management.
@@ -8619,7 +8630,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # tail regions -- see model/glm5_next/cache_layout.py, which owns the
             # offsets. The runner deliberately does not know them: it allocates whole
             # pages and the model slices.
-            if isinstance(kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+            if _is_single_vector_spec(kv_cache_spec):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size = kv_cache_spec.page_size_bytes
@@ -8980,7 +8991,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Pseudo-layers whose page the model lays out itself (DeepSeek-V4.1: a windowed
         # group of raw K plus compressor state, a full group of compressed entries). One
         # vector per token at ``page_elems / block_size`` wide, so the spec's page is
-        # exactly the model's; a windowed one is a SlidingWindowMLASpec so vLLM frees
+        # exactly the model's; a windowed one is a SlidingWindowSpec so vLLM frees
         # blocks that leave the window. The model checks the bound view's width.
         for paged in getattr(target_kv_spec, "paged_layers", ()):
             if paged.page_elems % paged.block_size:
@@ -8997,10 +9008,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     dtype=paged.dtype,
                 )
             else:
-                spec = SlidingWindowMLASpec(
+                # A plain SlidingWindowSpec with no V half, deliberately not a
+                # SlidingWindowMLASpec: the latter routes vLLM 0.24 into its
+                # DeepSeek-V4 packed grouping (group_and_unify_kv_cache_specs), which
+                # wraps every group in UniformTypeKVCacheSpecs. This keeps the
+                # generic hybrid path gpt_oss's full + SWA groups already take.
+                spec = SlidingWindowSpec(
                     block_size=paged.block_size,
                     num_kv_heads=1,
                     head_size=width,
+                    head_size_v=0,
                     dtype=paged.dtype,
                     sliding_window=paged.sliding_window,
                 )
