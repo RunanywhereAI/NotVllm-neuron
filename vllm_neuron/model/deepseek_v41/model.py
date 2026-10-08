@@ -225,8 +225,10 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
     last = torch.where(lens > 0, _idiv((lens - 1).clamp_min(0), block_size), torch.full_like(lens, -1))
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
     top = topk_indices(scores, min(topk_blocks, num_blocks))
+    # isneginf, not ``> -inf``: torch_xla promotes a tensor compared with a Python float
+    # scalar to f64, which neuronx-cc rejects (NCC_ESPP004)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top, scores.gather(-1, top) > -torch.inf)
+        -1, top, ~torch.isneginf(scores.gather(-1, top)))
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
