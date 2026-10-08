@@ -58,6 +58,18 @@ except ImportError:  # pragma: no cover - hosts without nki (the oracle laptop)
     _nf_topk = None
 
 
+def _idiv(x: torch.Tensor, d: int) -> torch.Tensor:
+    """Integer division of a NON-NEGATIVE tensor. Truncating division lowers to an integer
+    divide; floor division and ``remainder`` on int64 lower through float64, which
+    neuronx-cc rejects (NCC_ESPP004). For non-negative operands the two agree."""
+    return torch.div(x, d, rounding_mode="trunc")
+
+
+def _imod(x: torch.Tensor, d: int) -> torch.Tensor:
+    """``x mod d`` for a NON-NEGATIVE tensor; see ``_idiv``."""
+    return torch.fmod(x, d)
+
+
 def topk_indices(x: torch.Tensor, k: int) -> torch.Tensor:
     """Indices of the ``k`` largest along the last dim.
 
@@ -209,7 +221,8 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
-    last = (compress_lens - 1) // block_size
+    lens = torch.as_tensor(compress_lens)
+    last = torch.where(lens > 0, _idiv((lens - 1).clamp_min(0), block_size), torch.full_like(lens, -1))
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
     top = topk_indices(scores, min(topk_blocks, num_blocks))
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
@@ -251,8 +264,8 @@ class Step:
         ``[n, N_c]`` with ``N_c = nbc * comp_block / ratio``."""
         per = lay.comp_block // ratio
         j = torch.arange(self.c_blocks.shape[1] * per, device=self.pos.device)
-        page = self.c_blocks.index_select(1, j // per)
-        return page, (j % per).expand_as(page)
+        page = self.c_blocks.index_select(1, _idiv(j, per))
+        return page, _imod(j, per).expand_as(page)
 
 
 def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor,
@@ -276,23 +289,26 @@ def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor,
     s = pos[:, 0]
 
     Bw = lay.window_block
-    w_page = torch.where(live, slot_w // Bw, torch.full_like(slot_w, sink))
-    w_tok = torch.where(live, slot_w % Bw, torch.zeros_like(slot_w))
+    slot_w = slot_w.clamp_min(0)
+    w_page = torch.where(live, _idiv(slot_w, Bw), torch.full_like(slot_w, sink))
+    w_tok = torch.where(live, _imod(slot_w, Bw), torch.zeros_like(slot_w))
 
     W = lay.window_size
     h_pos = s.unsqueeze(1) - W + torch.arange(W, device=pos.device)
     blocks_w = paged_block_ids(bt_w, live_rows, num_pages)
     off = mw.get("swa_kv_pos_offset") if decode else None
     base = (h_pos - off.to(torch.long).view(n, 1)) if off is not None else h_pos
-    bidx = base.div(Bw, rounding_mode="floor")
+    # negative only where h_pos < 0, which h_ok rejects; clamped so every address is in range
+    bidx = _idiv(base.clamp_min(0), Bw)
     h_ok = (h_pos >= 0) & (bidx >= 0) & (bidx < blocks_w.shape[1]) & live_rows.view(n, 1)
     h_page = blocks_w.gather(1, bidx.clamp(0, blocks_w.shape[1] - 1))
     h_page = torch.where(h_ok, h_page, torch.full_like(h_page, zero_page))
-    h_tok = h_pos.remainder(Bw)
+    h_tok = _imod(h_pos.clamp_min(0), Bw)
 
     Bc = lay.comp_block
-    c_page = torch.where(live, slot_c // Bc, torch.full_like(slot_c, sink))
-    c_off = slot_c % Bc
+    slot_c = slot_c.clamp_min(0)
+    c_page = torch.where(live, _idiv(slot_c, Bc), torch.full_like(slot_c, sink))
+    c_off = _imod(slot_c, Bc)
     c_blocks = paged_block_ids(mc["block_table_tensor"], live_rows, num_pages)
     return Step(decode=decode, pos=pos, live=live, s=s, w_page=w_page, w_tok=w_tok,
                 h_pos=h_pos, h_page=h_page, h_tok=h_tok, h_ok=h_ok, c_page=c_page,
@@ -398,21 +414,21 @@ class Compressor(nn.Module):
             # the previous token is the newest history row
             prev_kv = caches.read_window(f_kv, step.h_page[:, -1:], step.h_tok[:, -1:]).float()
             prev_sc = caches.read_window(f_sc, step.h_page[:, -1:], step.h_tok[:, -1:]).float()
-            closes = step.live[:, 0] & (p.remainder(r) == r - 1) & (prev[:, 0] >= 0)
+            closes = step.live[:, 0] & (_imod(p, r) == r - 1) & (prev[:, 0] >= 0)
             # only ratio 2 is released; a larger ratio would need r - 1 history rows
             if r != 2:
                 raise NotImplementedError(f"compress ratio {r} in decode")
             kv2 = torch.cat([torch.where(closes.view(n, 1, 1), prev_kv, torch.zeros_like(prev_kv)), kv], 1)
             sc2 = torch.cat([torch.where(closes.view(n, 1, 1), prev_sc, torch.zeros_like(prev_sc)), score], 1)
             latent = (kv2 * sc2.softmax(dim=1)).sum(dim=1, keepdim=True)
-            j0, valid = p.div(r, rounding_mode="floor"), closes.view(n, 1)
+            j0, valid = _idiv(p, r), closes.view(n, 1)
         else:
             G = T // r
             kvg = kv[:, :G * r].unflatten(1, (G, r))
             scg = score[:, :G * r].unflatten(1, (G, r))
             latent = (kvg * scg.softmax(dim=2)).sum(dim=2)
             valid = step.live[:, r - 1::r][:, :G] & step.live[:, 0::r][:, :G]
-            j0 = step.s.div(r, rounding_mode="floor")
+            j0 = _idiv(step.s, r)
         caches.write_window(f_kv, step.w_page, step.w_tok, kv)
         caches.write_window(f_sc, step.w_page, step.w_tok, score)
         return self.norm(latent.to(dtype)), j0, valid
@@ -458,7 +474,7 @@ class Indexer(nn.Module):
         fresh: Fresh = shared["fresh"][owner]
         k = _substitute(k, fresh.index_k, fresh.j0, fresh.valid)
         N = k.shape[1]
-        lens = (step.pos + 1).div(r, rounding_mode="floor")                  # [n, T]
+        lens = _idiv(step.pos + 1, r)                                       # [n, T]
         reach = torch.arange(N, device=x.device) < lens.unsqueeze(-1)       # [n, T, N]
         k = torch.where(reach.any(dim=1).unsqueeze(-1), k, torch.zeros_like(k)).float()
         # per-head scores are [T, heads, N] before the head reduction: bound that by
@@ -542,7 +558,7 @@ class Attention(nn.Module):
             tok_page, tok_off = step.c_page[:, 0::r][:, :G], step.c_off[:, 0::r][:, :G]
         _, sink = reserved_pages(caches.num_pages)
         page = torch.where(valid, tok_page, torch.full_like(tok_page, sink))
-        entry = torch.where(valid, tok_off.div(r, rounding_mode="floor"), torch.zeros_like(tok_off))
+        entry = torch.where(valid, _idiv(tok_off, r), torch.zeros_like(tok_off))
         caches.write_comp(self.layer_id, page, entry, latent, index=False)
         caches.write_comp(self.layer_id, page, entry, index_k, index=True)
         return Fresh(latent=latent, index_k=index_k, j0=j0, valid=valid)
