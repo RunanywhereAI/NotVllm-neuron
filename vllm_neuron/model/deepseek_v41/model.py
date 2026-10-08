@@ -428,10 +428,19 @@ class Compressor(nn.Module):
             latent = (kv2 * sc2.softmax(dim=1)).sum(dim=1, keepdim=True)
             j0, valid = _idiv(p, r), closes.view(n, 1)
         else:
+            if r != 2:
+                raise NotImplementedError(f"compress ratio {r} in prefill")
+            # pair tokens along the LAST dim and take the two-way softmax explicitly: the
+            # unflatten/sum form fed the indexer's wk matmul a pattern neuronx-cc's
+            # NeuronInstComb could not delinearize (NCC_INIC901) at the real shapes
             G = T // r
-            kvg = kv[:, :G * r].unflatten(1, (G, r))
-            scg = score[:, :G * r].unflatten(1, (G, r))
-            latent = (kvg * scg.softmax(dim=2)).sum(dim=2)
+            kv2 = kv[:, :G * r].reshape(n, G, r * self.head_dim)
+            sc2 = score[:, :G * r].reshape(n, G, r * self.head_dim)
+            a, b = kv2[..., :self.head_dim], kv2[..., self.head_dim:]
+            sa, sb = sc2[..., :self.head_dim], sc2[..., self.head_dim:]
+            m = torch.maximum(sa, sb)
+            ea, eb = torch.exp(sa - m), torch.exp(sb - m)
+            latent = (a * ea + b * eb) / (ea + eb)
             valid = step.live[:, r - 1::r][:, :G] & step.live[:, 0::r][:, :G]
             j0 = _idiv(step.s, r)
         caches.write_window(f_kv, step.w_page, step.w_tok, kv)
@@ -464,7 +473,9 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(self.head_dim, args.norm_eps)
 
     def keys(self, latent, cos, sin):
-        return rope_tail(self.k_norm(self.wk(latent)), cos, sin, self.rd)
+        # fp32 projection (see Compressor.forward on NCC_INIC901); cast back after
+        k = F.linear(latent.float(), self.wk.weight.float()).to(latent.dtype)
+        return rope_tail(self.k_norm(k), cos, sin, self.rd)
 
     def forward(self, x, qr, cos, sin, step: Step, caches: Caches, shared: dict):
         n, T, _ = x.shape
