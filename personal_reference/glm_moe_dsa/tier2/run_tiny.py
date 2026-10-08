@@ -140,12 +140,12 @@ def make(out: str):
     (out / "oracle_reference.json").write_text(json.dumps({"new_tokens": NEW, "prompts": prompts}))
 
 
-def run(ckpt: str, tp: int):
+def run(ckpt: str, tp: int, seqs: int = 4):
     from vllm import LLM, SamplingParams
 
     ref = json.loads((pathlib.Path(ckpt) / "oracle_reference.json").read_text())
     llm = LLM(model=ckpt, skip_tokenizer_init=True, dtype="float32", max_model_len=1024,
-              max_num_seqs=4, tensor_parallel_size=tp, enable_expert_parallel=tp > 1,
+              max_num_seqs=seqs, tensor_parallel_size=tp, enable_expert_parallel=tp > 1,
               enable_prefix_caching=False, enforce_eager=True, max_logprobs=1, block_size=16,
               max_num_batched_tokens=512,
               additional_config={"neuron_config": {"on_device_sampling_config": None, "ep_degree": tp}},
@@ -165,6 +165,7 @@ def run(ckpt: str, tp: int):
         worst = max([worst] + d)
         print(f"prompt {len(p['prompt']):3d}: tokens match {prefix}/{len(p['greedy'])}; max |dlogprob| "
               f"{max(d) if d else math.nan:.2e}; got {got}")
+        print("   per-step |dlogprob|", " ".join(f"{x:.1e}" for x in d))
     print(f"TOTAL {ok}/{tot}; worst |dlogprob| {worst:.2e}")
     return 0 if ok == tot and worst < 1e-3 else 1
 
@@ -174,4 +175,5 @@ if __name__ == "__main__":
     if sys.argv[1] == "make":
         make(sys.argv[2])
     else:
-        sys.exit(run(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 1))
+        sys.exit(run(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 1,
+                     int(sys.argv[4]) if len(sys.argv) > 4 else 4))

@@ -845,7 +845,8 @@ class Checkpoint:
 
 class CheckpointSource:
     """Slices of the HF checkpoint. An FP8 weight reads only the blocks covering the slice
-    and is dequantized to bf16 (its scale fp32 times e4m3, rounded once)."""
+    and is dequantized in fp32; ``load_from`` rounds it once, to the parameter's dtype
+    (returning bf16 here cost an fp32 model 1e-2 in logprobs)."""
 
     def __init__(self, ckpt: Checkpoint, block):
         self.ckpt, self.block = ckpt, block
@@ -866,7 +867,7 @@ class CheckpointSource:
             w = q.float() * s.repeat_interleave(bn, 0)[: R1 - R0].repeat_interleave(bk, 1)[:, : C1 - C0]
             if not torch.isfinite(w).all():
                 raise ValueError(f"{name}: non-finite after dequantization")
-            return w[r0 - R0:r1 - R0, c0 - C0:c1 - C0].to(torch.bfloat16)
+            return w[r0 - R0:r1 - R0, c0 - C0:c1 - C0]
         r0, r1 = _span(shape[0], rows)
         if cols is None:
             return sl[r0:r1]
