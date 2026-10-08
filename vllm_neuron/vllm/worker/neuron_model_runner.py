@@ -8594,6 +8594,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # allocation puts there. vLLM's own null block cannot serve as the
             # zero page -- warmup leaves data in it.
             size = tensor.size + (2 * page_bytes if page_major else 0)
+            if getattr(self.model, "kv_cache_unshared", False):
+                # One buffer per layer. Two views of one buffer, both written in the
+                # same compiled step, are two aliased graph inputs, and a runtime that
+                # copies each back after execution can clobber one group's writes with
+                # the other's stale copy. Block ids stay global, so each buffer holds
+                # every block; the memory is what the compiler already budgets, since
+                # it counts each view as its own input anyway.
+                for layer_name in tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = torch.zeros(
+                        size, dtype=torch.int8, device=self.device
+                    )
+                continue
             raw_tensor = torch.zeros(size, dtype=torch.int8, device=self.device)
             # Case where the KV cache is shared across layers
             for layer_name in tensor.shared_by:
