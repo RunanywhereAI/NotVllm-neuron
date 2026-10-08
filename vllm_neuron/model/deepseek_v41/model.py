@@ -713,8 +713,16 @@ class MoE(nn.Module):
         self.etp = par.etp
         self.I_local = _part(I, par.etp, "moe_inter_dim")
         self.gate = Gate(args)
-        self.gate_up_proj = nn.Parameter(torch.zeros(self.E_local, D, 2, self.I_local))
-        self.down_proj = nn.Parameter(torch.zeros(self.E_local, self.I_local, D))
+        # FP8 e4m3 with a power-of-two scale per output channel: lossless from the MXFP4
+        # checkpoint (every value is e2m1 x 2^k), and half of bf16 -- which is what makes
+        # the model fit 24 GB per core at TP64/EP64. Values stay within +-240, where
+        # e4m3fn and trn2's e4m3 encode identically.
+        self.gate_up_proj = nn.Parameter(
+            torch.zeros(self.E_local, D, 2, self.I_local, dtype=torch.float8_e4m3fn), requires_grad=False)
+        self.gate_up_scale = nn.Parameter(torch.ones(self.E_local, 1, 2, self.I_local))
+        self.down_proj = nn.Parameter(
+            torch.zeros(self.E_local, self.I_local, D, dtype=torch.float8_e4m3fn), requires_grad=False)
+        self.down_scale = nn.Parameter(torch.ones(self.E_local, 1, D))
         self.shared_experts = Expert(D, _part(I, par.tp, "moe_inter_dim"), args.swiglu_limit)
 
     def _routed_dense(self, x, w, idx, rank):
@@ -723,10 +731,12 @@ class MoE(nn.Module):
         dense = torch.zeros(x.shape[0], self.E, dtype=torch.float32, device=x.device)
         local = _idiv(rank, self.etp) * self.E_local + torch.arange(self.E_local, device=x.device)
         dense = dense.scatter(1, idx, w).index_select(1, local)
-        gu = torch.einsum("td,edgi->tegi", x, self.gate_up_proj)
+        w_gu = self.gate_up_proj.to(x.dtype) * self.gate_up_scale.to(x.dtype)  # exact: pow2 scales
+        w_d = self.down_proj.to(x.dtype) * self.down_scale.to(x.dtype)
+        gu = torch.einsum("td,edgi->tegi", x, w_gu)
         h = _clamped_swiglu(gu[:, :, 0].float(), gu[:, :, 1].float(), self.limit)
         h = (h * dense.unsqueeze(-1)).to(x.dtype)
-        return torch.einsum("tei,eid->td", h, self.down_proj).float()
+        return torch.einsum("tei,eid->td", h, w_d).float()
 
     def forward(self, x, rank):
         shape = x.shape
@@ -872,7 +882,18 @@ class Block(nn.Module):
 # ------------------------------------------------------------------------ model
 # Parameters the reference stores in float32 whatever the model dtype.
 _FP32_SUFFIXES = ("attn_sink", "gate.bias", "hc_attn_fn", "hc_ffn_fn", "hc_attn_base",
-                  "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale", "head.weight")
+                  "hc_ffn_base", "hc_attn_scale", "hc_ffn_scale", "head.weight",
+                  "gate_up_scale", "down_scale")
+
+
+def fp8_per_channel(w: torch.Tensor, reduce_dim: int):
+    """``w`` -> (float8_e4m3fn values, fp32 power-of-two scale broadcastable to ``w``), the
+    scale per output channel (reducing over ``reduce_dim``) so that |values| <= 240."""
+    w = w.float()
+    amax = w.abs().amax(dim=reduce_dim, keepdim=True).clamp_min(2.0 ** -100)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 240.0)))
+    q = (w / scale).to(torch.float8_e4m3fn)
+    return q, scale
 
 
 class DeepseekV41Model(nn.Module):
@@ -1093,16 +1114,35 @@ class DeepseekV41Model(nn.Module):
             I_s = layer.ffn.shared_experts.w1.weight.shape[0]
             span = (par.rank * I_s, (par.rank + 1) * I_s)
             return src.get(name, cols=span) if ".w2." in rest else src.get(name, rows=span)
-        if rest in ("ffn.gate_up_proj", "ffn.down_proj"):
+        if rest in ("ffn.gate_up_proj", "ffn.gate_up_scale", "ffn.down_proj", "ffn.down_scale"):
             moe = layer.ffn
-            span = (par.etp_rank * moe.I_local, (par.etp_rank + 1) * moe.I_local)
-            experts = range(moe.e0, moe.e0 + moe.E_local)
-            e = f"{pre}ffn.experts"
-            if rest == "ffn.down_proj":
-                return torch.stack([src.get(f"{e}.{x}.w2.weight", cols=span).T for x in experts])
-            return torch.stack([torch.stack([src.get(f"{e}.{x}.w1.weight", rows=span).T,
-                                             src.get(f"{e}.{x}.w3.weight", rows=span).T], dim=1)
-                                for x in experts])
+            which = "gate_up" if "gate_up" in rest else "down"
+            cache = self.__dict__.setdefault("_fp8_cache", {})
+            key = (i, which)
+            if key not in cache:
+                span = (par.etp_rank * moe.I_local, (par.etp_rank + 1) * moe.I_local)
+                experts = range(moe.e0, moe.e0 + moe.E_local)
+                e = f"{pre}ffn.experts"
+                if which == "down":
+                    w = torch.stack([src.get(f"{e}.{x}.w2.weight", cols=span).T for x in experts])
+                    q, sc = fp8_per_channel(w, 1)                       # [E, I, D]: per D
+                else:
+                    w = torch.stack([torch.stack([src.get(f"{e}.{x}.w1.weight", rows=span).T,
+                                                  src.get(f"{e}.{x}.w3.weight", rows=span).T], dim=1)
+                                     for x in experts])
+                    q, sc = fp8_per_channel(w, 1)                       # [E, D, 2, I]: per (2, I)
+                err = (q.float() * sc - w.float()).abs().max().item()
+                if err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "layer %d %s: fp8 re-encoding not exact, max abs err %.3g", i, which, err)
+                cache[key] = [q, sc, 2]
+            entry = cache[key]
+            out = entry[1] if rest.endswith("scale") else entry[0]
+            entry[2] -= 1
+            if entry[2] == 0:
+                del cache[key]
+            return out
         if rest in ("engram.embed.weight", "engram.embed.scale"):
             emb = layer.engram.embed
             t = src.get(name, rows=(emb.r0, emb.r0 + emb.rows_local), pad=True)
@@ -1119,6 +1159,8 @@ class DeepseekV41Model(nn.Module):
             t = self.local_tensor(name, src)
             if tuple(t.shape) != tuple(p.shape):
                 raise ValueError(f"{name}: source gives {tuple(t.shape)}, rank expects {tuple(p.shape)}")
+            if t.dtype != p.dtype and p.dtype == torch.float8_e4m3fn:
+                raise TypeError(f"{name}: expected float8_e4m3fn from the loader, got {t.dtype}")
             sd[name] = t.to(dtype=p.dtype, device=device or p.device).contiguous()
         self.load_state_dict(sd, strict=True, assign=True)
         if device is not None:
