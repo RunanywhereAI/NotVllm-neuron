@@ -23,9 +23,10 @@ can address is no wider than ``index_topk`` the selection is every causal positi
 no top-k is run at all (static: decided from shapes at trace time).
 
 **FP8.** The checkpoint is e4m3 with one fp32 ``scale_inv`` per 128x128 block. Routed
-experts and the replicated attention projections (``q_a_proj``, ``kv_a_proj_with_mqa``,
-the indexer's ``wq_b`` / ``wk``) stay FP8 on device and are dequantized blockwise in the
-graph; everything TP-sharded is dequantized to the model dtype at load. trn2's e4m3
+experts and the one replicated FP8 projection (the indexer's ``wk``) stay FP8 on device
+and are dequantized blockwise in the graph; everything TP-sharded is dequantized to the
+model dtype at load. ``q_a_proj``, ``kv_a_proj_with_mqa`` and the indexer's ``wq_b`` are
+output-sharded and all-gathered rather than replicated (1.2 GB per rank at full depth). trn2's e4m3
 tops out at 240 while the checkpoint uses e4m3fn's 448, so every block whose values
 exceed 240 is stored halved with its scale doubled (``fp8_le240``): exact except the
 odd-LSB subnormals of such a block, which lose one bit (measured and logged at load).
@@ -359,13 +360,15 @@ class Indexer(nn.Module):
 
     query_chunk = 128
 
-    def __init__(self, args: GlmMoeDsaArgs, layer_id: int):
+    def __init__(self, args: GlmMoeDsaArgs, layer_id: int, par: Parallel = Parallel()):
         super().__init__()
-        self.layer_id = layer_id
+        self.layer_id, self.par = layer_id, par
         self.n_heads, self.head_dim = args.index_n_heads, args.index_head_dim
         self.rd = args.qk_rope_head_dim
         self.index_topk = args.index_topk
-        self.wq_b = Linear(args.q_lora_rank, self.n_heads * self.head_dim, args.fp8_block)
+        # output rows split over TP and all-gathered: replicated it is 8.4M params x 21
+        # layers per rank; the per-rank slice is small enough to keep in the model dtype
+        self.wq_b = Linear(args.q_lora_rank, _part(self.n_heads * self.head_dim, par.tp, "index q width"))
         self.wk = Linear(args.dim, self.head_dim, args.fp8_block)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = Linear(args.dim, self.n_heads)
@@ -374,7 +377,7 @@ class Indexer(nn.Module):
         n, T, _ = x.shape
         rd = self.rd
         cos, sin = step.cos, step.sin
-        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q = self.par.all_gather(self.wq_b(qr), dim=qr.dim() - 1).unflatten(-1, (self.n_heads, self.head_dim))
         q = torch.cat([rope_interleave(q[..., :rd], cos.unsqueeze(2), sin.unsqueeze(2)),
                        q[..., rd:]], dim=-1)
         k = self.k_norm(self.wk(x))
@@ -413,25 +416,30 @@ class Attention(nn.Module):
         self.kvr = args.kv_lora_rank
         self.qk = self.nope + self.rd
         self.scale = self.qk ** -0.5
-        blk = args.fp8_block
-        self.q_a_proj = Linear(args.dim, args.q_lora_rank, blk)
+        # q_a_proj / kv_a_proj_with_mqa: output rows split over TP and all-gathered. Every
+        # rank needs the whole q latent (its head's q_b_proj, the indexer) and the whole
+        # 576-wide KV row (the replicated cache), but replicating the weights cost 1.2 GB
+        # per rank at full depth; the per-rank slices are kept in the model dtype.
+        self.par = par
+        self.q_a_proj = Linear(args.dim, _part(args.q_lora_rank, par.tp, "q_lora_rank"))
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, args.norm_eps)
         self.q_b_proj = Linear(args.q_lora_rank, self.n_heads * self.qk)
-        self.kv_a_proj_with_mqa = Linear(args.dim, self.kvr + self.rd, blk)
+        self.kv_a_proj_with_mqa = Linear(args.dim, _part(self.kvr + self.rd, par.tp, "kv_lora_rank + rope"))
         self.kv_a_layernorm = RMSNorm(self.kvr, args.norm_eps)
         self.kv_b_proj = Linear(self.kvr, self.n_heads * (self.nope + self.vd))
         self.o_proj = Linear(self.n_heads * self.vd, args.dim)
-        self.indexer = Indexer(args, layer_id) if args.indexer_types[layer_id] == "full" else None
+        self.indexer = Indexer(args, layer_id, par) if args.indexer_types[layer_id] == "full" else None
 
     def forward(self, x, step: Step, caches: Caches, shared: dict):
         n, T, _ = x.shape
         H = self.n_heads
         cos, sin = step.cos, step.sin
-        qr = self.q_a_layernorm(self.q_a_proj(x))
+        last = x.dim() - 1
+        qr = self.q_a_layernorm(self.par.all_gather(self.q_a_proj(x), dim=last))
         q = self.q_b_proj(qr).view(n, T, H, self.qk)
         q_nope = q[..., : self.nope]
         q_pe = rope_interleave(q[..., self.nope:], cos.unsqueeze(2), sin.unsqueeze(2))
-        kv = self.kv_a_proj_with_mqa(x)
+        kv = self.par.all_gather(self.kv_a_proj_with_mqa(x), dim=last)
         lat = self.kv_a_layernorm(kv[..., : self.kvr])
         k_pe = rope_interleave(kv[..., self.kvr:], cos, sin)
         fresh = torch.cat([lat, k_pe], dim=-1)                             # [n, T, 576]
@@ -707,6 +715,10 @@ class GlmMoeDsaModel(nn.Module):
         pre = f"model.layers.{i}."
         layer = self.model.layers[i]
         at = layer.self_attn
+        if rest in ("self_attn.q_a_proj.weight", "self_attn.kv_a_proj_with_mqa.weight",
+                    "self_attn.indexer.wq_b.weight"):
+            out = self.get_submodule(name.rsplit(".", 1)[0]).weight.shape[0]
+            return src.get(name, rows=(par.rank * out, (par.rank + 1) * out))
         if rest == "self_attn.q_b_proj.weight":
             return src.get(name, rows=(at.h0 * at.qk, (at.h0 + at.n_heads) * at.qk))
         if rest == "self_attn.kv_b_proj.weight":
