@@ -787,8 +787,10 @@ class EngramEmbedding(nn.Module):
         local = ids - rank * self.rows_local
         off = (local < 0) | (local >= self.rows_local)
         local = torch.where(off, torch.zeros_like(local), local)
-        v = self.e4m3[F.embedding(local, self.weight).long()]
-        s = self.e8m0[F.embedding(local, self.scale).long()]
+        # ``& 255``: the device may carry uint8 as signed int8, which would turn every
+        # negative fp8 byte into a negative, out-of-bounds table index
+        v = self.e4m3[F.embedding(local, self.weight).to(torch.int32) & 255]
+        s = self.e8m0[F.embedding(local, self.scale).to(torch.int32) & 255]
         v = v.unflatten(-1, (-1, self.block)) * s.unsqueeze(-1)
         v = v.flatten(-2).to(torch.bfloat16)
         v = torch.where(off.unsqueeze(-1), torch.zeros_like(v), v)
