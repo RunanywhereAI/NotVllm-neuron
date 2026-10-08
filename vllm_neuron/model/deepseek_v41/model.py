@@ -601,7 +601,7 @@ class Gate(nn.Module):
         super().__init__()
         self.topk = args.n_activated_experts
         self.score_func = args.score_func
-        self.gate_temp = args.gate_temp
+        self.gate_temp = getattr(args, "gate_temp", 1.0)   # not in the released config
         self.norm_topk_prob = args.norm_topk_prob
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.zeros(args.n_routed_experts, args.dim))
@@ -857,7 +857,7 @@ class DeepseekV41Model(nn.Module):
         h = F.embedding(torch.where(off, torch.zeros_like(local), local), self.embed.weight)
         return self.par.all_reduce(torch.where(off.unsqueeze(-1), torch.zeros_like(h), h))
 
-    def forward(self, input_ids, positions, attn_metadata, engram_ids=None):
+    def hidden_states(self, input_ids, positions, attn_metadata, engram_ids=None):
         """``[tokens] -> [tokens, dim]`` hidden states after the final hc collapse and norm.
 
         ``engram_ids [tokens, n_engram_layers, cols]`` are the n-gram hash rows,
@@ -889,6 +889,72 @@ class DeepseekV41Model(nn.Module):
         """fp32 logits; this rank's vocab slice unless ``gather``."""
         local = F.linear(hidden.float(), self.head.weight.float())
         return self.par.all_gather(local, dim=-1) if gather else local
+
+    # -- the runner's surface --------------------------------------------------------------
+    on_device_sampling_config = None
+    _gather_logits = False
+
+    def attach_sampler(self, neuron_config) -> None:
+        """On-device sampling over the vocab-sharded logits, as GLM and Qwen3.5 do."""
+        self.on_device_sampling_config = getattr(neuron_config, "on_device_sampling_config", None)
+        self._gather_logits = neuron_config is not None and (
+            getattr(neuron_config, "max_logprobs", 0) != 0
+            or getattr(neuron_config, "debug_logits_dir", None) is not None)
+        if self.on_device_sampling_config is not None:
+            from vllm_neuron.nn.sampler import Sampler
+
+            group = getattr(self.par.group, "device_group", None)
+            self.sampler = Sampler(self.on_device_sampling_config, process_group=group)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    @torch.no_grad()
+    def forward(self, input_ids, positions, rotary_position_ids=None, attn_metadata=None,
+                sampling_positions=None, sampling_params=None, spec_decode_metadata=None,
+                logit_mask=None, rank=None, engram_ids=None, **_unused):
+        if spec_decode_metadata is not None:
+            raise NotImplementedError("speculative decoding (MTP / DSpark) is out of scope")
+        hidden = self.hidden_states(input_ids, positions, attn_metadata, engram_ids)
+        if sampling_positions is not None:
+            hidden = torch.index_select(hidden, 0, sampling_positions)
+        if self.on_device_sampling_config is None:
+            return self.compute_logits(hidden)
+        logits = self.compute_logits(hidden, gather=False)
+        gathered = self.par.all_gather(logits, dim=-1) if self._gather_logits else None
+        sampled = self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank)
+        return sampled, gathered
+
+    # -- Engram ids, computed on the host by the runner -------------------------------------
+    @property
+    def has_engram(self) -> bool:
+        return bool(self.engram_index)
+
+    def engram_cols(self) -> int:
+        a = self.args
+        return (a.engram_max_ngram_size - 1) * a.engram_n_heads
+
+    def engram_dummy_ids(self, num_tokens: int) -> torch.Tensor:
+        return torch.zeros(num_tokens, len(self.engram_index), self.engram_cols(), dtype=torch.int32)
+
+    def set_engram_hasher(self, hasher) -> None:
+        self.engram_hasher = hasher
+
+    def engram_host_ids(self, token_ids: torch.Tensor, rows: torch.Tensor,
+                        positions: torch.Tensor) -> torch.Tensor:
+        """``token_ids [max_reqs, max_len]`` (the runner's ``token_ids_cpu``), and per
+        scheduled token its request row (-1 for a padded row) and position ->
+        ``[tokens, n_engram_layers, cols]`` int32. Padded rows hash position 0 of row 0;
+        their output is discarded."""
+        hasher = self.engram_hasher
+        n = hasher.n
+        dead = rows < 0
+        rows = rows.clamp_min(0).to(torch.long)
+        pos = torch.where(dead, torch.zeros_like(positions), positions).to(torch.long)
+        shifts = torch.arange(n)
+        src = (pos.unsqueeze(1) - shifts).clamp_min(0)
+        window = token_ids[rows.unsqueeze(1), src]                         # [T, n] raw ids
+        return hasher.hash_windows(window, pos).to(torch.int32)
 
     # -- weights -------------------------------------------------------------------------
     def local_tensor(self, name: str, src) -> torch.Tensor:
@@ -961,6 +1027,10 @@ class DeepseekV41Model(nn.Module):
 
         with Checkpoint(checkpoint_path) as ckpt:
             self.load_from(CheckpointSource(ckpt), device)
+        if self.has_engram:
+            from .engram import hasher_for
+
+            self.set_engram_hasher(hasher_for(self.args, checkpoint_path))
 
 
 def _span(n: int, span):
@@ -1020,3 +1090,39 @@ class CheckpointSource:
             part = torch.cat([part, torch.zeros(r1 - r0 - part.shape[0], *part.shape[1:],
                                                 dtype=part.dtype)])
         return part.float() if e.action == W.TO_FP32 else part
+
+
+def from_configs(hf_config, text_neuron_config=None, **_):
+    """The runner's constructor (reached through ``factory.DeepseekV41ForCausalLM``).
+
+    Called under ``torch.device("meta")``; ``load_weights`` materialises. The window block
+    is vLLM's cache block size; the compressed block follows from it (``cache_layout``).
+    """
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from .config import DeepseekV41TextArgs
+
+    args = DeepseekV41TextArgs.from_hf_config(hf_config)
+    tp = get_tp_group()
+    world, rank = tp.world_size, tp.rank_in_group
+    ep = getattr(text_neuron_config, "ep_degree", 1) or 1
+    if ep > 1:
+        # [unverified on device] the plugin's EP coordinates, as gpt_oss and GLM read them
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_ep_degree, get_neuron_ep_rank, get_neuron_ep_tp_group)
+        ep_tp = get_neuron_ep_tp_group()
+        par = Parallel(tp=world, rank=rank, ep=get_neuron_ep_degree(), ep_rank=get_neuron_ep_rank(),
+                       etp=ep_tp.world_size, etp_rank=ep_tp.rank_in_group, group=tp)
+    else:
+        par = Parallel(tp=world, rank=rank, ep=1, ep_rank=0, etp=world, etp_rank=rank, group=tp)
+    vc = get_current_vllm_config()
+    dtype = vc.model_config.dtype
+    model = DeepseekV41Model(args, block_size=vc.cache_config.block_size, cache_dtype=dtype, par=par)
+    model.set_dtype(dtype)
+    model.attach_sampler(text_neuron_config)
+    if model.has_engram and vc.scheduler_config.async_scheduling:
+        raise NotImplementedError(
+            "DeepSeek-V4.1's Engram hashes the request's newest tokens on the host, which "
+            "asynchronous scheduling has not written yet; serve with --no-async-scheduling")
+    return model
