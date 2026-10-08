@@ -158,10 +158,13 @@ class FakeRunner:
     def __init__(self, model, block_size: int, num_blocks: int, max_blocks: int):
         self.m, self.B, self.nb = model, block_size, max_blocks
         pe = model.layout.page_elems
-        pages = torch.full((num_blocks + 2, pe), float("nan"))
         zero_page, _ = M.reserved_pages(num_blocks + 2)
-        pages[zero_page] = 0
-        model.bind_kv_cache({M.CACHE_LAYER: [pages]})
+        kv = {}
+        for i in range(model.args.n_layers):          # one buffer per layer, as vLLM allocates
+            pages = torch.full((num_blocks + 2, pe), float("nan"))
+            pages[zero_page] = 0
+            kv[model.cache_name(i)] = [pages]
+        model.bind_kv_cache(kv)
         self.free = list(range(1, num_blocks))   # block 0 is vLLM's null block
         torch.manual_seed(1)
         self.free = [self.free[i] for i in torch.randperm(len(self.free)).tolist()]
@@ -176,6 +179,9 @@ class FakeRunner:
             out.append(tab[p // self.B] * self.B + p % self.B)
         return out
 
+    def _md(self, entry):
+        return {self.m.cache_name(i): entry for i in range(self.m.args.n_layers)}
+
     def _bt(self, rid):
         tab = self.tables.get(rid, [])
         return tab + [0] * (self.nb - len(tab))
@@ -188,9 +194,8 @@ class FakeRunner:
         ids = torch.tensor(tokens + [0] * pad)
         positions = torch.tensor(pos + [pos[-1]] * pad)
         slot = torch.tensor(slots + [0] * pad)
-        md = {M.CACHE_LAYER: {"block_table_tensor": torch.tensor([self._bt(rid)]),
-                              "slot_mapping": slot, "max_query_len": bucket,
-                              "decode_token_threshold": 1}}
+        md = self._md({"block_table_tensor": torch.tensor([self._bt(rid)]),
+                       "slot_mapping": slot, "max_query_len": bucket, "decode_token_threshold": 1})
         return self.m(ids, positions, attn_metadata=md)[:L]
 
     def decode(self, reqs, n_rows):
@@ -204,8 +209,8 @@ class FakeRunner:
         for _ in range(n_rows - len(reqs)):
             ids.append(0); pos.append(0); slot.append(0)
             bt.append([self.tables[reqs[0][0]][0]] * self.nb)        # stale ids
-        md = {M.CACHE_LAYER: {"block_table_tensor": torch.tensor(bt), "slot_mapping": torch.tensor(slot),
-                              "max_query_len": 1, "decode_token_threshold": 1}}
+        md = self._md({"block_table_tensor": torch.tensor(bt), "slot_mapping": torch.tensor(slot),
+                       "max_query_len": 1, "decode_token_threshold": 1})
         return self.m(torch.tensor(ids), torch.tensor(pos), attn_metadata=md)[: len(reqs)]
 
 
