@@ -130,7 +130,7 @@ class FakeRunner:
         ids = torch.tensor(list(tokens) + [tokens[-1]] * (bucket - n))
         if engram_ids is not None:
             engram_ids = torch.cat([engram_ids, engram_ids[-1:].expand(bucket - n, *engram_ids.shape[1:])])
-        h = self.model(ids, torch.tensor(pos), md, engram_ids=engram_ids)
+        h = self.model.hidden_states(ids, torch.tensor(pos), md, engram_ids=engram_ids)
         return self.model.compute_logits(h)[:n]
 
     def _swa_blocks(self):
@@ -170,5 +170,5 @@ class FakeRunner:
         if engram_ids is not None:
             engram_ids = torch.cat([engram_ids, torch.zeros(pad_rows, *engram_ids.shape[1:],
                                                             dtype=engram_ids.dtype)])
-        h = self.model(ids, pos, md, engram_ids=engram_ids)
+        h = self.model.hidden_states(ids, pos, md, engram_ids=engram_ids)
         return self.model.compute_logits(h)[: len(reqs)]

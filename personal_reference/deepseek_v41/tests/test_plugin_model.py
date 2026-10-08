@@ -79,9 +79,9 @@ def deferred_writes(monkeypatch):
         queue.append((cache, rows.clone(), idx.clone()))
         return cache
 
-    fwd = M.DeepseekV41Model.forward
+    fwd = M.DeepseekV41Model.hidden_states
 
-    def forward(self, *a, **k):
+    def hidden_states(self, *a, **k):
         out = fwd(self, *a, **k)
         for c, r, i in queue:
             real(c, r, i)
@@ -89,7 +89,7 @@ def deferred_writes(monkeypatch):
         return out
 
     monkeypatch.setattr(M, "write_cache_rows", write)
-    monkeypatch.setattr(M.DeepseekV41Model, "forward", forward)
+    monkeypatch.setattr(M.DeepseekV41Model, "hidden_states", hidden_states)
 
 
 def test_matches_oracle(setup):
