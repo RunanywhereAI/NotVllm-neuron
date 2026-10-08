@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -4525,6 +4526,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
         if rotary_position_ids is not None:
             warmup_kwargs["rotary_position_ids"] = rotary_position_ids
+        if (engram_model := self._engram_model()) is not None:
+            warmup_kwargs["engram_ids"] = engram_model.engram_dummy_ids(num_tokens).to(device)
         if self.supports_mm_inputs:
             max_num_vision_blocks = self.max_vision_blocks_per_request
             warmup_kwargs["vision_embedding_blocks"] = tuple(
@@ -4861,6 +4864,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             rank=rank_tensor,
             logit_mask=dummy_logit_mask,
         )
+        if (engram_model := self._engram_model()) is not None:
+            decode_warmup_kwargs["engram_ids"] = engram_model.engram_dummy_ids(
+                num_tokens
+            ).to(device)
         # Always inject prev-step kwargs when the model is decorated. The
         # decorator's prologue calls
         # ``correct_spec_decode_positions_and_slot_mapping`` unconditionally
@@ -6949,6 +6956,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         )
 
+    def _engram_model(self):
+        """The model if it takes host-computed Engram hash ids (DeepSeek-V4.1), else None."""
+        model = getattr(self, "model", None)
+        model = getattr(model, "_orig_mod", model)
+        return model if getattr(model, "has_engram", False) else None
+
+    def _engram_host_ids(self, model, positions: torch.Tensor, attn_metadata) -> torch.Tensor:
+        """Engram hash rows for every scheduled token, from the requests' token history.
+
+        The hash multiplies and XORs 64-bit integers, which Neuron engines evaluate
+        through float32, so it is computed here. Each token needs the ids at its own
+        and the previous ``max_ngram_size - 1`` positions, all already in
+        ``token_ids_cpu`` under synchronous scheduling (the model refuses async).
+        Decode token ``i`` belongs to batch row ``i // tokens_per_req``; a prefill step
+        is one request, its pads repeating the last position.
+        """
+        first = next(iter(attn_metadata.values()))
+        per_req = first["decode_token_threshold"]
+        num_reqs = self.input_batch.num_reqs
+        positions = positions.cpu()
+        n = positions.shape[0]
+        if first["max_query_len"] <= per_req:
+            rows = torch.arange(n) // per_req
+            rows = torch.where(rows < num_reqs, rows, torch.full_like(rows, -1))
+        else:
+            if num_reqs != 1:
+                raise NotImplementedError(
+                    f"Engram host ids for a prefill step of {num_reqs} requests"
+                )
+            rows = torch.zeros(n, dtype=torch.long)
+        return model.engram_host_ids(self.input_batch.token_ids_cpu_tensor, rows, positions)
+
     def _execute_model_forward(
         self,
         input_ids: torch.Tensor,
@@ -6984,6 +7023,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 input_ids,
                 positions,
             )
+
+        # Host-side model inputs, computed while positions are still on the CPU.
+        engram_ids = None
+        if (engram_model := self._engram_model()) is not None:
+            engram_ids = self._engram_host_ids(engram_model, positions, attn_metadata)
 
         # Move inputs to Neuron device
         input_ids = input_ids.to(self.device)
@@ -7052,6 +7096,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "rank": self.rank_tensor,
         }
         model_kwargs["logit_mask"] = logit_mask
+        if engram_ids is not None:
+            model_kwargs["engram_ids"] = engram_ids.to(self.device)
         if rotary_position_ids is not None:
             model_kwargs["rotary_position_ids"] = rotary_position_ids.to(self.device)
 
@@ -8573,7 +8619,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # tail regions -- see model/glm5_next/cache_layout.py, which owns the
             # offsets. The runner deliberately does not know them: it allocates whole
             # pages and the model slices.
-            if isinstance(kv_cache_spec, MLAAttentionSpec):
+            if isinstance(kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size = kv_cache_spec.page_size_bytes
@@ -8930,6 +8976,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dtype=lat_layer.dtype,
                 page_size_padded=lat_layer.page_bytes_for(block_size),
             )
+
+        # Pseudo-layers whose page the model lays out itself (DeepSeek-V4.1: a windowed
+        # group of raw K plus compressor state, a full group of compressed entries). One
+        # vector per token at ``page_elems / block_size`` wide, so the spec's page is
+        # exactly the model's; a windowed one is a SlidingWindowMLASpec so vLLM frees
+        # blocks that leave the window. The model checks the bound view's width.
+        for paged in getattr(target_kv_spec, "paged_layers", ()):
+            if paged.page_elems % paged.block_size:
+                raise ValueError(
+                    f"paged layer {paged.name!r}: {paged.page_elems} elements do not "
+                    f"divide into {paged.block_size} tokens"
+                )
+            width = paged.page_elems // paged.block_size
+            if paged.sliding_window is None:
+                spec = MLAAttentionSpec(
+                    block_size=paged.block_size,
+                    num_kv_heads=1,
+                    head_size=width,
+                    dtype=paged.dtype,
+                )
+            else:
+                spec = SlidingWindowMLASpec(
+                    block_size=paged.block_size,
+                    num_kv_heads=1,
+                    head_size=width,
+                    dtype=paged.dtype,
+                    sliding_window=paged.sliding_window,
+                )
+            if spec.page_size_bytes != paged.page_elems * get_dtype_size(paged.dtype):
+                raise AssertionError(
+                    f"paged layer {paged.name!r}: vLLM sizes its page at "
+                    f"{spec.page_size_bytes} B, the model at "
+                    f"{paged.page_elems * get_dtype_size(paged.dtype)} B"
+                )
+            all_kv_cache_specs[paged.name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
