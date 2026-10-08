@@ -71,18 +71,59 @@ def _linear(in_f: int, out_f: int) -> nn.Linear:
     return nn.Linear(in_f, out_f, bias=False)
 
 
+@dataclasses.dataclass(frozen=True)
+class Parallel:
+    """Where this rank sits.
+
+    ``tp`` ranks share the attention: ``n_heads / tp`` query heads each, with the MQA
+    caches, the compressor and the indexer replicated (one KV head cannot be split).
+    The routed experts are ``ep`` groups x ``etp`` intermediate shards, ``ep * etp ==
+    tp``. Every sublayer ends in one all-reduce over all ``tp`` ranks.
+
+    ``group``: anything with vLLM ``GroupCoordinator``'s ``all_reduce(t) -> t`` and
+    ``all_gather(t, dim)``.
+    """
+
+    tp: int = 1
+    rank: int = 0
+    ep: int = 1
+    ep_rank: int = 0
+    etp: int = 1
+    etp_rank: int = 0
+    group: object = None
+
+    def __post_init__(self):
+        if self.ep * self.etp != self.tp:
+            raise ValueError(f"EP {self.ep} x expert TP {self.etp} != TP {self.tp}")
+
+    def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
+        return t if self.tp == 1 else self.group.all_reduce(t)
+
+    def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
+        return t if self.tp == 1 else self.group.all_gather(t, dim=dim)
+
+
+def _part(n: int, parts: int, what: str) -> int:
+    if n % parts:
+        raise ValueError(f"{what}={n} does not divide over {parts} ranks")
+    return n // parts
+
+
 @functools.lru_cache(maxsize=8)
 def rope_freqs(dim: int, original_seq_len: int, base: float, factor: float,
                beta_fast: int, beta_slow: int) -> torch.Tensor:
-    """The reference's ``precompute_freqs_cis`` without the position table: fp32 [dim/2]."""
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    """The reference's ``precompute_freqs_cis`` without the position table: fp32 [dim/2].
+    Always on CPU, so a model built on the meta device still gets real frequencies."""
+    cpu = torch.device("cpu")
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=cpu) / dim))
     if original_seq_len > 0:
         def corrected_dim(rotations):
             return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
 
         low = max(math.floor(corrected_dim(beta_fast)), 0)
         high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
-        ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / max(high - low, 1e-3)).clamp(0, 1)
+        ramp = ((torch.arange(dim // 2, dtype=torch.float32, device=cpu) - low)
+                / max(high - low, 1e-3)).clamp(0, 1)
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
     return freqs
@@ -415,26 +456,37 @@ class Attention(nn.Module):
     """Sliding window of raw K plus, at ratio > 0, ``index_topk`` compressed entries, in
     one softmax with a per-head sink."""
 
-    def __init__(self, args, layer_id: int):
+    def __init__(self, args, layer_id: int, par: Parallel = Parallel()):
         super().__init__()
         self.layer_id = layer_id
-        self.n_heads = args.n_heads
         self.head_dim = args.head_dim
         self.rd = args.rope_head_dim
-        self.n_groups = args.o_groups
         self.o_lora_rank = args.o_lora_rank
         self.window_size = args.window_size
         self.ratio = args.compress_ratios[layer_id]
         self.softmax_scale = self.head_dim ** -0.5
         eps = args.norm_eps
+        # Heads split over the TP ranks. wo_a is block-diagonal over o_groups: up to
+        # o_groups ranks each own whole groups; past that each owns part of one group
+        # and holds that group's wo_b columns, and the sublayer all-reduce sums the
+        # partial group projections -- wo_b is linear, so the order does not matter.
+        self.n_heads = _part(args.n_heads, par.tp, "n_heads")
+        self.h0 = par.rank * self.n_heads
+        per_group = _part(args.n_heads, args.o_groups, "n_heads per o_group")
+        if self.n_heads >= per_group:
+            self.n_groups = _part(self.n_heads, per_group, "local heads per o_group")
+            self.group_heads = per_group
+        else:
+            _part(per_group, self.n_heads, "o_group heads per rank")
+            self.n_groups, self.group_heads = 1, self.n_heads
+        self.g0 = self.h0 // per_group
         self.attn_sink = nn.Parameter(torch.zeros(self.n_heads))
         self.wq_a = _linear(args.dim, args.q_lora_rank)
         self.q_norm = RMSNorm(args.q_lora_rank, eps)
         self.wq_b = _linear(args.q_lora_rank, self.n_heads * self.head_dim)
         self.wkv = _linear(args.dim, self.head_dim)
         self.kv_norm = RMSNorm(self.head_dim, eps)
-        self.wo_a = _linear(self.n_heads * self.head_dim // self.n_groups,
-                            self.n_groups * self.o_lora_rank)
+        self.wo_a = _linear(self.group_heads * self.head_dim, self.n_groups * self.o_lora_rank)
         self.wo_b = _linear(self.n_groups * self.o_lora_rank, args.dim)
         self.is_kv_source = layer_id in args.kv_source_layers
         self.is_index_source = layer_id in args.index_source_layers
@@ -519,7 +571,7 @@ class Attention(nn.Module):
         o = o.reshape(n, T, G, -1)
         wo_a = self.wo_a.weight.view(G, self.o_lora_rank, -1)
         o = torch.einsum("ntgd,grd->ntgr", o, wo_a)
-        return self.wo_b(o.flatten(2))
+        return self.wo_b(o.flatten(2))                                     # partial under TP
 
 
 # --------------------------------------------------------------------------- MoE
@@ -571,23 +623,28 @@ class Gate(nn.Module):
 
 
 class MoE(nn.Module):
-    """Routed experts in the NKI MoE layout plus one shared expert."""
+    """Routed experts in the NKI MoE layout plus one shared expert. Returns this rank's
+    partial sum in fp32: its local experts' share and its slice of the shared expert."""
 
-    def __init__(self, args):
+    def __init__(self, args, par: Parallel = Parallel()):
         super().__init__()
         if args.n_shared_experts != 1:
             raise NotImplementedError("exactly one shared expert")
         E, D, I = args.n_routed_experts, args.dim, args.moe_inter_dim
         self.E, self.limit = E, args.swiglu_limit
+        self.E_local = _part(E, par.ep, "n_routed_experts")
+        self.e0 = par.ep_rank * self.E_local
+        self.I_local = _part(I, par.etp, "moe_inter_dim")
         self.gate = Gate(args)
-        self.gate_up_proj = nn.Parameter(torch.zeros(E, D, 2, I))
-        self.down_proj = nn.Parameter(torch.zeros(E, I, D))
-        self.shared_experts = Expert(D, I, args.swiglu_limit)
+        self.gate_up_proj = nn.Parameter(torch.zeros(self.E_local, D, 2, self.I_local))
+        self.down_proj = nn.Parameter(torch.zeros(self.E_local, self.I_local, D))
+        self.shared_experts = Expert(D, _part(I, par.tp, "moe_inter_dim"), args.swiglu_limit)
 
     def _routed_dense(self, x, w, idx):
-        """Every expert on every token, zero weight off the top-k: exact, static, CPU only."""
+        """Every local expert on every token, zero weight off the top-k: exact, static,
+        CPU only. Clamping per intermediate shard is exact: the clamps are elementwise."""
         dense = torch.zeros(x.shape[0], self.E, dtype=torch.float32, device=x.device)
-        dense = dense.scatter(1, idx, w)
+        dense = dense.scatter(1, idx, w).narrow(1, self.e0, self.E_local)
         gu = torch.einsum("td,edgi->tegi", x, self.gate_up_proj)
         h = _clamped_swiglu(gu[:, :, 0].float(), gu[:, :, 1].float(), self.limit)
         h = (h * dense.unsqueeze(-1)).to(x.dtype)
@@ -599,45 +656,58 @@ class MoE(nn.Module):
         w, idx = self.gate(x)
         y = self._routed_dense(x, w, idx)
         y = y + self.shared_experts(x).float()
-        return y.to(x.dtype).view(shape)
+        return y.view(*shape[:-1], -1)
 
 
 # ------------------------------------------------------------------------ engram
 class EngramEmbedding(nn.Module):
-    """The n-gram table, FP8 with a per-32 e8m0 scale, dequantized to bf16 on lookup."""
+    """The n-gram table, FP8 with a per-32 e8m0 scale, dequantized to bf16 on lookup.
+    Rows split ``ceil(rows / tp)`` per rank; a row off this rank reads as zero and the
+    all-reduce sums in the one real copy, exactly."""
 
-    def __init__(self, rows: int, dim: int, block: int = 32):
+    def __init__(self, rows: int, dim: int, par: Parallel = Parallel(), block: int = 32):
         super().__init__()
-        self.block = block
-        self.weight = nn.Parameter(torch.zeros(rows, dim, dtype=torch.float8_e4m3fn), requires_grad=False)
-        self.scale = nn.Parameter(torch.zeros(rows, dim // block, dtype=torch.float8_e8m0fnu),
-                                  requires_grad=False)
+        self.block, self.par = block, par
+        self.rows_local = -(-rows // par.tp)
+        self.r0 = par.rank * self.rows_local
+        self.weight = nn.Parameter(torch.zeros(self.rows_local, dim, dtype=torch.float8_e4m3fn),
+                                   requires_grad=False)
+        self.scale = nn.Parameter(torch.zeros(self.rows_local, dim // block,
+                                              dtype=torch.float8_e8m0fnu), requires_grad=False)
 
     def forward(self, ids):
-        v = F.embedding(ids, self.weight.view(torch.uint8)).view(torch.float8_e4m3fn)
-        s = F.embedding(ids, self.scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+        local = ids - self.r0
+        off = (local < 0) | (local >= self.rows_local)
+        local = torch.where(off, torch.zeros_like(local), local)
+        v = F.embedding(local, self.weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+        s = F.embedding(local, self.scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
         v = v.float().unflatten(-1, (-1, self.block)) * s.float().unsqueeze(-1)
-        return v.flatten(-2).to(torch.bfloat16)
+        v = v.flatten(-2).to(torch.bfloat16)
+        v = torch.where(off.unsqueeze(-1), torch.zeros_like(v), v)
+        return self.par.all_reduce(v)
 
 
 class Engram(nn.Module):
     """Gated n-gram lookup added to every hc copy of the residual stream."""
 
-    def __init__(self, args, layer_id: int, rows: int):
+    def __init__(self, args, layer_id: int, rows: int, par: Parallel = Parallel()):
         super().__init__()
         self.layer_id = layer_id
         self.dim, self.hc = args.dim, args.hc_mult
         self.eps = args.norm_eps
+        self.par = par
         cols = (args.engram_max_ngram_size - 1) * args.engram_n_heads
-        self.embed = EngramEmbedding(rows, args.engram_head_dim)
-        self.wkv = _linear(cols * args.engram_head_dim, args.dim * (args.hc_mult + 1))
+        self.embed = EngramEmbedding(rows, args.engram_head_dim, par)
+        # output rows split over ranks, gathered back: 25600 x 6144 is too big to replicate
+        out = _part(args.dim * (args.hc_mult + 1), par.tp, "engram wkv rows")
+        self.wkv = _linear(cols * args.engram_head_dim, out)
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
 
     def forward(self, h, hash_ids):
         """h ``[..., hc, dim]``; hash_ids ``[..., cols]``."""
         emb = self.embed(hash_ids).flatten(-2).to(self.wkv.weight.dtype)
-        kv = self.wkv(emb)
+        kv = self.par.all_gather(self.wkv(emb), dim=-1)
         key, value = kv.split([self.hc * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc, self.dim))
         weight = self.q_weight.float() * self.k_weight.float()
@@ -652,14 +722,15 @@ class Engram(nn.Module):
 class Block(nn.Module):
     """mHC block. The pre-mix a sublayer computes is used by the NEXT sublayer."""
 
-    def __init__(self, args, layer_id: int, engram_rows: int | None):
+    def __init__(self, args, layer_id: int, engram_rows: int | None, par: Parallel = Parallel()):
         super().__init__()
         self.layer_id = layer_id
+        self.par = par
         self.norm_eps = args.norm_eps
         self.hc, self.iters, self.hc_eps = args.hc_mult, args.hc_sinkhorn_iters, args.hc_eps
-        self.attn = Attention(args, layer_id)
-        self.ffn = MoE(args)
-        self.engram = Engram(args, layer_id, engram_rows) if engram_rows is not None else None
+        self.attn = Attention(args, layer_id, par)
+        self.ffn = MoE(args, par)
+        self.engram = Engram(args, layer_id, engram_rows, par) if engram_rows is not None else None
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         mix, hd = (2 + self.hc) * self.hc, self.hc * args.dim
@@ -692,12 +763,13 @@ class Block(nn.Module):
         residual = h
         a_pre, a_post, a_comb = self.hc_mixes(h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm(self.hc_pre(h, pre_mix))
-        x = self.attn(x, step, caches, shared)
+        # partial sums reduced in fp32, as the reference's RowParallelLinear and MoE do
+        x = self.par.all_reduce(self.attn(x, step, caches, shared).float()).to(h.dtype)
         h = self.hc_post(x, residual, a_post, a_comb)
         residual = h
         f_pre, f_post, f_comb = self.hc_mixes(h, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = self.ffn_norm(self.hc_pre(h, a_pre))
-        x = self.ffn(x)
+        x = self.par.all_reduce(self.ffn(x)).to(h.dtype)
         h = self.hc_post(x, residual, f_post, f_comb)
         return h, f_pre
 
@@ -710,13 +782,14 @@ _FP32_SUFFIXES = ("attn_sink", "gate.bias", "hc_attn_fn", "hc_ffn_fn", "hc_attn_
 
 class DeepseekV41Model(nn.Module):
     """The decoder. Parameter names equal the reference's (``embed``, ``layers``, ``norm``,
-    ``head``), experts excepted."""
+    ``head``), experts excepted; shapes are this rank's (see ``Parallel``)."""
 
     kv_cache_page_major = True
 
-    def __init__(self, args, block_size: int = 32, cache_dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, args, block_size: int = 32, cache_dtype: torch.dtype = torch.bfloat16,
+                 par: Parallel = Parallel()):
         super().__init__()
-        self.args = args
+        self.args, self.par = args, par
         n = args.n_layers
         ratios = args.compress_ratios[:n]
         self.kv_sources = tuple(s for s in args.kv_source_layers if s < n)
@@ -730,24 +803,29 @@ class DeepseekV41Model(nn.Module):
             if s is None or x is None or ratios[s] != ratios[i] or ratios[x] != ratios[i]:
                 raise ValueError(f"layer {i}: no kv/index source of ratio {ratios[i]}")
 
+        self.vocab_local = _part(args.vocab_size, par.tp, "vocab_size")
+        self.v0 = par.rank * self.vocab_local
         engram_rows = dict(zip(args.engram_layer_ids, args.engram_num_embeddings))
-        self.embed = nn.Embedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList(Block(args, i, engram_rows.get(i)) for i in range(n))
+        self.embed = nn.Module()
+        self.embed.weight = nn.Parameter(torch.zeros(self.vocab_local, args.dim))
+        self.layers = nn.ModuleList(Block(args, i, engram_rows.get(i), par) for i in range(n))
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = nn.Module()
-        self.head.weight = nn.Parameter(torch.zeros(args.vocab_size, args.dim))
+        self.head.weight = nn.Parameter(torch.zeros(self.vocab_local, args.dim))
         self.hc = args.hc_mult
         self.layout = CacheLayout.build(args, block_size, cache_dtype)
         self.engram_index = {lid: k for k, lid in enumerate(args.engram_layer_ids)}
 
     # -- dtypes ------------------------------------------------------------------------
+    def keeps_fp32(self, name: str) -> bool:
+        return name.endswith(_FP32_SUFFIXES) or (
+            ".compressor.w" in name and self.args.compress_ratios[int(name.split(".")[1])] > 1)
+
     def set_dtype(self, dtype: torch.dtype) -> "DeepseekV41Model":
         for name, p in self.named_parameters():
             if not p.is_floating_point() or p.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
                 continue
-            keep32 = name.endswith(_FP32_SUFFIXES) or (
-                ".compressor.w" in name and self.args.compress_ratios[int(name.split(".")[1])] > 1)
-            p.data = p.data.to(torch.float32 if keep32 else dtype)
+            p.data = p.data.to(torch.float32 if self.keeps_fp32(name) else dtype)
         return self
 
     # -- caches ------------------------------------------------------------------------
@@ -772,6 +850,13 @@ class DeepseekV41Model(nn.Module):
         self.caches = Caches(lay, w, c)
 
     # -- forward -------------------------------------------------------------------------
+    def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+        """Vocab-sharded lookup: an id off this rank reads row 0 and is zeroed."""
+        local = ids - self.v0
+        off = (local < 0) | (local >= self.vocab_local)
+        h = F.embedding(torch.where(off, torch.zeros_like(local), local), self.embed.weight)
+        return self.par.all_reduce(torch.where(off.unsqueeze(-1), torch.zeros_like(h), h))
+
     def forward(self, input_ids, positions, attn_metadata, engram_ids=None):
         """``[tokens] -> [tokens, dim]`` hidden states after the final hc collapse and norm.
 
@@ -783,7 +868,7 @@ class DeepseekV41Model(nn.Module):
             raise RuntimeError("bind_kv_cache() has not been called")
         step = build_step(self.layout, self.caches.num_pages, positions, attn_metadata)
         n, T = step.n, step.T
-        h = self.embed(input_ids.view(n, T))
+        h = self.embed_tokens(input_ids.view(n, T))
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
         pre_mix = torch.zeros(n, T, self.hc, dtype=torch.float32, device=h.device)
         pre_mix[..., 0] = 1.0
@@ -800,24 +885,138 @@ class DeepseekV41Model(nn.Module):
         h = Block.hc_pre(h, pre_mix)
         return self.norm(h).view(n * T, -1)
 
-    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden.float(), self.head.weight.float())
+    def compute_logits(self, hidden: torch.Tensor, gather: bool = True) -> torch.Tensor:
+        """fp32 logits; this rank's vocab slice unless ``gather``."""
+        local = F.linear(hidden.float(), self.head.weight.float())
+        return self.par.all_gather(local, dim=-1) if gather else local
 
     # -- weights -------------------------------------------------------------------------
-    def load_reference_state_dict(self, sd: dict, strict: bool = True):
-        """Load reference-named, dequantized tensors; stacks the routed experts."""
-        sd = dict(sd)
-        E = self.args.n_routed_experts
-        for i, layer in enumerate(self.layers):
-            p = f"layers.{i}.ffn.experts"
-            w1 = [sd.pop(f"{p}.{e}.w1.weight") for e in range(E)]
-            w3 = [sd.pop(f"{p}.{e}.w3.weight") for e in range(E)]
-            w2 = [sd.pop(f"{p}.{e}.w2.weight") for e in range(E)]
-            sd[f"layers.{i}.ffn.gate_up_proj"] = torch.stack(
-                [torch.stack([a.T, b.T], dim=1) for a, b in zip(w1, w3)])
-            sd[f"layers.{i}.ffn.down_proj"] = torch.stack([w.T for w in w2])
-        own = self.state_dict()
-        for k, v in sd.items():
-            if k in own:
-                sd[k] = v.to(own[k].dtype)
-        return self.load_state_dict(sd, strict=strict)
+    def local_tensor(self, name: str, src) -> torch.Tensor:
+        """This rank's value of parameter ``name``, read from ``src`` (``DictSource`` /
+        ``CheckpointSource``), which serves reference-named, dequantized slices."""
+        a, par = self.args, self.par
+        parts = name.split(".")
+        if name in ("embed.weight", "head.weight"):
+            return src.get(name, rows=(self.v0, self.v0 + self.vocab_local))
+        if parts[0] != "layers":
+            return src.get(name)
+        i, rest = int(parts[1]), ".".join(parts[2:])
+        layer = self.layers[i]
+        pre = f"layers.{i}."
+        at, Dh, R = layer.attn, a.head_dim, a.o_lora_rank
+        if rest == "attn.attn_sink":
+            return src.get(name, rows=(at.h0, at.h0 + at.n_heads))
+        if rest == "attn.wq_b.weight":
+            return src.get(name, rows=(at.h0 * Dh, (at.h0 + at.n_heads) * Dh))
+        if rest == "attn.wo_a.weight":
+            off = at.h0 % (a.n_heads // a.o_groups)
+            return src.get(name, rows=(at.g0 * R, (at.g0 + at.n_groups) * R),
+                           cols=(off * Dh, (off + at.group_heads) * Dh))
+        if rest == "attn.wo_b.weight":
+            return src.get(name, cols=(at.g0 * R, (at.g0 + at.n_groups) * R))
+        if rest.startswith("ffn.shared_experts."):
+            I_s = layer.ffn.shared_experts.w1.weight.shape[0]
+            span = (par.rank * I_s, (par.rank + 1) * I_s)
+            return src.get(name, cols=span) if ".w2." in rest else src.get(name, rows=span)
+        if rest in ("ffn.gate_up_proj", "ffn.down_proj"):
+            moe = layer.ffn
+            span = (par.etp_rank * moe.I_local, (par.etp_rank + 1) * moe.I_local)
+            experts = range(moe.e0, moe.e0 + moe.E_local)
+            e = f"{pre}ffn.experts"
+            if rest == "ffn.down_proj":
+                return torch.stack([src.get(f"{e}.{x}.w2.weight", cols=span).T for x in experts])
+            return torch.stack([torch.stack([src.get(f"{e}.{x}.w1.weight", rows=span).T,
+                                             src.get(f"{e}.{x}.w3.weight", rows=span).T], dim=1)
+                                for x in experts])
+        if rest in ("engram.embed.weight", "engram.embed.scale"):
+            emb = layer.engram.embed
+            return src.get(name, rows=(emb.r0, emb.r0 + emb.rows_local), pad=True)
+        if rest == "engram.wkv.weight":
+            out = layer.engram.wkv.weight.shape[0]
+            return src.get(name, rows=(par.rank * out, (par.rank + 1) * out))
+        return src.get(name)
+
+    def load_from(self, src, device=None) -> None:
+        own = dict(self.named_parameters())
+        sd = {}
+        for name, p in own.items():
+            t = self.local_tensor(name, src)
+            if tuple(t.shape) != tuple(p.shape):
+                raise ValueError(f"{name}: source gives {tuple(t.shape)}, rank expects {tuple(p.shape)}")
+            sd[name] = t.to(dtype=p.dtype, device=device or p.device).contiguous()
+        self.load_state_dict(sd, strict=True, assign=True)
+        if device is not None:
+            for m in self.modules():
+                for k, b in list(m._buffers.items()):
+                    if b is not None:
+                        m._buffers[k] = b.to(device)
+
+    def load_reference_state_dict(self, sd: dict) -> None:
+        """Tests: a full reference-named, dequantized state dict."""
+        self.load_from(DictSource(sd))
+
+    def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None):
+        """The runner's entry point: this rank's slices of the HF checkpoint, dequantized."""
+        from .weights import Checkpoint
+
+        with Checkpoint(checkpoint_path) as ckpt:
+            self.load_from(CheckpointSource(ckpt), device)
+
+
+def _span(n: int, span):
+    return (0, n) if span is None else span
+
+
+class DictSource:
+    """Slices of full, already-dequantized tensors."""
+
+    def __init__(self, sd: dict):
+        self.sd = sd
+
+    def get(self, name, rows=None, cols=None, pad=False):
+        t = self.sd[name]
+        r0, r1 = _span(t.shape[0], rows)
+        part = t[r0:min(r1, t.shape[0])]
+        if cols is not None:
+            part = part[:, cols[0]:cols[1]]
+        if pad and part.shape[0] < r1 - r0:
+            part = torch.cat([part, part.new_zeros(r1 - r0 - part.shape[0], *part.shape[1:])])
+        return part
+
+
+class CheckpointSource:
+    """Slices of the HF checkpoint, read lazily: an FP8 weight reads only the 32x32
+    blocks covering the slice, so no rank materialises a tensor it does not need."""
+
+    def __init__(self, ckpt):
+        from . import weights as W
+
+        self.ckpt, self.W = ckpt, W
+
+    def get(self, name, rows=None, cols=None, pad=False):
+        W, ck = self.W, self.ckpt
+        e = ck.plan.entries[name]
+        if e.action == W.DEQUANT_FP8:
+            ws, ss = ck.raw_slice(e.source), ck.raw_slice(e.scale)
+            n, k = ws.get_shape()
+            (r0, r1), (c0, c1) = _span(n, rows), _span(k, cols)
+            bn, bk = W.FP8_BLOCK
+            R0, C0 = r0 // bn * bn, c0 // bk * bk
+            R1, C1 = min(-(-r1 // bn) * bn, n), min(-(-c1 // bk) * bk, k)
+            w = W.dequant_fp8_block(ws[R0:R1, C0:C1], ss[R0 // bn:-(-R1 // bn), C0 // bk:-(-C1 // bk)],
+                                    name=name)
+            return w[r0 - R0:r1 - R0, c0 - C0:c1 - C0]
+        if e.action == W.DEQUANT_MXFP4:
+            full = W.dequant_mxfp4(ck.raw(e.source), ck.raw(e.scale), name=name)
+            return DictSource({name: full}).get(name, rows, cols)
+        sl = ck.raw_slice(e.source)
+        shape = sl.get_shape()
+        r0, r1 = _span(shape[0], rows)
+        if cols is None:
+            part = sl[r0:min(r1, shape[0])]
+        else:
+            part = sl[r0:min(r1, shape[0]), cols[0]:cols[1]]
+        if pad and part.shape[0] < r1 - r0:
+            part = torch.cat([part, torch.zeros(r1 - r0 - part.shape[0], *part.shape[1:],
+                                                dtype=part.dtype)])
+        return part.float() if e.action == W.TO_FP32 else part
