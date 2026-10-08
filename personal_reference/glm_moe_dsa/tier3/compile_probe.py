@@ -116,15 +116,18 @@ class MetaRunner:
         self.model, self.M = model, M
         pe = model.layout.page_elems
         self.num_pages = NUM_BLOCKS + 2
-        model.bind_kv_cache({M.CACHE_LAYER: [torch.empty(self.num_pages, pe, dtype=torch.bfloat16, device=META)]})
-        print(f"block_size {BLOCK}, page {pe} elems ({pe * 2 / 2**20:.2f} MiB), pages {self.num_pages} "
-              f"-> {self.num_pages * pe * 2 / 2**30:.2f} GiB KV", flush=True)
+        L = model.args.n_layers
+        model.bind_kv_cache({model.cache_name(i): [torch.empty(self.num_pages, pe, dtype=torch.bfloat16, device=META)]
+                             for i in range(L)})
+        print(f"block_size {BLOCK}, per-layer page {pe} elems, {L} layer buffers of {self.num_pages} pages "
+              f"-> {L * self.num_pages * pe * 2 / 2**30:.2f} GiB KV", flush=True)
 
     def _md(self, rows, q, slots_len):
-        return {self.M.CACHE_LAYER: {
+        entry = {
             "block_table_tensor": torch.zeros(rows, -(-MAX_LEN // BLOCK), dtype=torch.int32, device=META),
             "slot_mapping": torch.zeros(slots_len, dtype=torch.int64, device=META),
-            "max_query_len": q, "decode_token_threshold": 1, "block_size": BLOCK}}
+            "max_query_len": q, "decode_token_threshold": 1, "block_size": BLOCK}
+        return {self.model.cache_name(i): entry for i in range(self.model.args.n_layers)}
 
     def prefill_inputs(self):
         T = T_PREFILL
