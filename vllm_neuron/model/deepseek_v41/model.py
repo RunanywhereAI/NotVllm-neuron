@@ -236,11 +236,17 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
     lens = torch.as_tensor(compress_lens)
     last = torch.where(lens > 0, _idiv((lens - 1).clamp_min(0), block_size), torch.full_like(lens, -1))
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
-    top = topk_indices(scores, min(topk_blocks, num_blocks))
     # isneginf, not ``> -inf``: torch_xla promotes a tensor compared with a Python float
     # scalar to f64, which neuronx-cc rejects (NCC_ESPP004)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top, ~torch.isneginf(scores.gather(-1, top)))
+    if topk_blocks >= num_blocks:
+        # every block is picked, so the picks are exactly the reachable (or pinned) ones.
+        # No top-k at k == width: that falls outside the NKI kernel's envelope, and the
+        # fallback faulted out of bounds on device at the released config (1024 of 1024)
+        keep = ~torch.isneginf(scores)
+    else:
+        top = topk_indices(scores, topk_blocks)
+        keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1, top, ~torch.isneginf(scores.gather(-1, top)))
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
