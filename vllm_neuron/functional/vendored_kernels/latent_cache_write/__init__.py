@@ -110,7 +110,9 @@ def write_cache_rows(cache: Tensor, rows: Tensor, row_idx: Tensor) -> Tensor:
     from .kernel import cache_row_scatter_kernel
 
     wrapped = wrap_nki(cache_row_scatter_kernel)
-    return wrapped[2](
+    # VLLM_NEURON_NKI_LNC_SPLIT=0: one physical core (see functional/topk.py)
+    grid = 1 if os.environ.get("VLLM_NEURON_NKI_LNC_SPLIT", "1") == "0" else 2
+    return wrapped[grid](
         cache=cache,
         new_rows=rows,
         row_idx=row_idx.to(torch.int32).view(-1, 1),
