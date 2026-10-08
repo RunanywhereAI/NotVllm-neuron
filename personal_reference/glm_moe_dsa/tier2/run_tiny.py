@@ -43,7 +43,7 @@ def make(out: str):
         q_lora_rank=32, qk_rope_head_dim=16, v_head_dim=16, qk_nope_head_dim=16, n_group=1,
         topk_group=1, num_experts_per_tok=2, norm_topk_prob=True, hidden_act="silu",
         max_position_embeddings=4096, rms_norm_eps=1e-5, first_k_dense_replace=1,
-        index_topk=16, index_head_dim=32, index_n_heads=8,
+        index_topk=int(os.environ.get("INDEX_TOPK", "16")), index_head_dim=32, index_n_heads=8,
         indexer_types=["full", "shared", "full", "shared", "shared", "full"],
         rope_parameters={"rope_theta": 8000000.0, "rope_type": "default"},
         rope_interleave=True, indexer_rope_interleave=True, tie_word_embeddings=False,
