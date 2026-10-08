@@ -70,6 +70,16 @@ def _imod(x: torch.Tensor, d: int) -> torch.Tensor:
     return torch.fmod(x, d)
 
 
+def fusion_barrier(x: torch.Tensor, dim: int, anchor: torch.Tensor) -> torch.Tensor:
+    """``x`` unchanged, materialised through a gather the compiler cannot fold: the index is
+    ``arange + 0 * anchor`` with ``anchor`` derived from a graph input. Stops neuronx-cc
+    fusing a strided producer into a consumer matmul, which tripped NCC_INIC901
+    ("NeuronInstComb: Cannot delinearize") on the indexer's ``wk`` at prefill shapes."""
+    zero = (anchor.reshape(-1)[:1] * 0).to(torch.long)
+    idx = torch.arange(x.shape[dim], device=x.device) + zero
+    return x.index_select(dim, idx)
+
+
 def topk_indices(x: torch.Tensor, k: int) -> torch.Tensor:
     """Indices of the ``k`` largest along the last dim.
 
@@ -565,7 +575,7 @@ class Attention(nn.Module):
         G = latent.shape[1]
         jpos = (j0.view(-1, 1) + torch.arange(G, device=x.device)) * r     # group's first token
         cos, sin = rope_cos_sin(self.freqs, jpos)
-        index_k = self.indexer.keys(latent, cos, sin)
+        index_k = self.indexer.keys(fusion_barrier(latent, 1, j0), cos, sin)
         latent = rope_tail(latent, cos, sin, self.rd)
         # address: the page and in-block entry of each group's first token
         if step.decode:
