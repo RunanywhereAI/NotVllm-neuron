@@ -252,6 +252,9 @@ class Step:
     c_page: torch.Tensor       # [n, T] write page of each token's compressed block
     c_off: torch.Tensor        # [n, T] token offset within that block
     c_blocks: torch.Tensor     # [n, nbc] sanitised block table
+    # this rank as a 0-d tensor: rank-dependent offsets read it, so all ranks trace one
+    # graph instead of baking 64 different constants
+    rank: torch.Tensor = None
 
     @property
     def n(self) -> int:
@@ -271,7 +274,7 @@ class Step:
 
 
 def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor,
-               attn_metadata: dict) -> Step:
+               attn_metadata: dict, rank: torch.Tensor) -> Step:
     mw, mc = attn_metadata[WINDOW_LAYER], attn_metadata[COMPRESSED_LAYER]
     decode = mw["max_query_len"] <= mw["decode_token_threshold"]
     zero_page, sink = reserved_pages(num_pages)
@@ -314,7 +317,7 @@ def build_step(lay: CacheLayout, num_pages: int, positions: torch.Tensor,
     c_blocks = paged_block_ids(mc["block_table_tensor"], live_rows, num_pages)
     return Step(decode=decode, pos=pos, live=live, s=s, w_page=w_page, w_tok=w_tok,
                 h_pos=h_pos, h_page=h_page, h_tok=h_tok, h_ok=h_ok, c_page=c_page,
-                c_off=c_off, c_blocks=c_blocks)
+                c_off=c_off, c_blocks=c_blocks, rank=rank.to(torch.long).reshape(()))
 
 
 @dataclasses.dataclass
@@ -678,28 +681,30 @@ class MoE(nn.Module):
         E, D, I = args.n_routed_experts, args.dim, args.moe_inter_dim
         self.E, self.limit = E, args.swiglu_limit
         self.E_local = _part(E, par.ep, "n_routed_experts")
-        self.e0 = par.ep_rank * self.E_local
+        self.e0 = par.ep_rank * self.E_local          # load time only; forward reads the rank tensor
+        self.etp = par.etp
         self.I_local = _part(I, par.etp, "moe_inter_dim")
         self.gate = Gate(args)
         self.gate_up_proj = nn.Parameter(torch.zeros(self.E_local, D, 2, self.I_local))
         self.down_proj = nn.Parameter(torch.zeros(self.E_local, self.I_local, D))
         self.shared_experts = Expert(D, _part(I, par.tp, "moe_inter_dim"), args.swiglu_limit)
 
-    def _routed_dense(self, x, w, idx):
-        """Every local expert on every token, zero weight off the top-k: exact, static,
-        CPU only. Clamping per intermediate shard is exact: the clamps are elementwise."""
+    def _routed_dense(self, x, w, idx, rank):
+        """Every local expert on every token, zero weight off the top-k: exact and static.
+        Clamping per intermediate shard is exact: the clamps are elementwise."""
         dense = torch.zeros(x.shape[0], self.E, dtype=torch.float32, device=x.device)
-        dense = dense.scatter(1, idx, w).narrow(1, self.e0, self.E_local)
+        local = _idiv(rank, self.etp) * self.E_local + torch.arange(self.E_local, device=x.device)
+        dense = dense.scatter(1, idx, w).index_select(1, local)
         gu = torch.einsum("td,edgi->tegi", x, self.gate_up_proj)
         h = _clamped_swiglu(gu[:, :, 0].float(), gu[:, :, 1].float(), self.limit)
         h = (h * dense.unsqueeze(-1)).to(x.dtype)
         return torch.einsum("tei,eid->td", h, self.down_proj).float()
 
-    def forward(self, x):
+    def forward(self, x, rank):
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         w, idx = self.gate(x)
-        y = self._routed_dense(x, w, idx)
+        y = self._routed_dense(x, w, idx, rank)
         y = y + self.shared_experts(x).float()
         return y.view(*shape[:-1], -1)
 
@@ -714,14 +719,14 @@ class EngramEmbedding(nn.Module):
         super().__init__()
         self.block, self.par = block, par
         self.rows_local = -(-rows // par.tp)
-        self.r0 = par.rank * self.rows_local
+        self.r0 = par.rank * self.rows_local          # load time only; forward reads the rank tensor
         self.weight = nn.Parameter(torch.zeros(self.rows_local, dim, dtype=torch.float8_e4m3fn),
                                    requires_grad=False)
         self.scale = nn.Parameter(torch.zeros(self.rows_local, dim // block,
                                               dtype=torch.float8_e8m0fnu), requires_grad=False)
 
-    def forward(self, ids):
-        local = ids - self.r0
+    def forward(self, ids, rank):
+        local = ids - rank * self.rows_local
         off = (local < 0) | (local >= self.rows_local)
         local = torch.where(off, torch.zeros_like(local), local)
         v = F.embedding(local, self.weight.view(torch.uint8)).view(torch.float8_e4m3fn)
@@ -749,9 +754,9 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
 
-    def forward(self, h, hash_ids):
+    def forward(self, h, hash_ids, rank):
         """h ``[..., hc, dim]``; hash_ids ``[..., cols]``."""
-        emb = self.embed(hash_ids).flatten(-2).to(self.wkv.weight.dtype)
+        emb = self.embed(hash_ids, rank).flatten(-2).to(self.wkv.weight.dtype)
         kv = self.par.all_gather(self.wkv(emb), dim=-1)
         key, value = kv.split([self.hc * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc, self.dim))
@@ -804,7 +809,7 @@ class Block(nn.Module):
 
     def forward(self, h, pre_mix, step, caches, shared, engram_ids):
         if self.engram is not None:
-            h = self.engram(h, engram_ids)
+            h = self.engram(h, engram_ids, step.rank)
         residual = h
         a_pre, a_post, a_comb = self.hc_mixes(h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn_norm(self.hc_pre(h, pre_mix))
@@ -814,7 +819,7 @@ class Block(nn.Module):
         residual = h
         f_pre, f_post, f_comb = self.hc_mixes(h, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = self.ffn_norm(self.hc_pre(h, a_pre))
-        x = self.par.all_reduce(self.ffn(x)).to(h.dtype)
+        x = self.par.all_reduce(self.ffn(x, step.rank)).to(h.dtype)
         h = self.hc_post(x, residual, f_post, f_comb)
         return h, f_pre
 
@@ -895,14 +900,20 @@ class DeepseekV41Model(nn.Module):
         self.caches = Caches(lay, w, c)
 
     # -- forward -------------------------------------------------------------------------
-    def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+    def embed_tokens(self, ids: torch.Tensor, rank: torch.Tensor | None = None) -> torch.Tensor:
         """Vocab-sharded lookup: an id off this rank reads row 0 and is zeroed."""
-        local = ids - self.v0
+        rank = self._rank(rank, ids.device)
+        local = ids - rank * self.vocab_local
         off = (local < 0) | (local >= self.vocab_local)
         h = F.embedding(torch.where(off, torch.zeros_like(local), local), self.embed.weight)
         return self.par.all_reduce(torch.where(off.unsqueeze(-1), torch.zeros_like(h), h))
 
-    def hidden_states(self, input_ids, positions, attn_metadata, engram_ids=None):
+    def _rank(self, rank, device) -> torch.Tensor:
+        if rank is None:
+            rank = torch.tensor(self.par.rank, device=device)
+        return rank.to(torch.long).reshape(())
+
+    def hidden_states(self, input_ids, positions, attn_metadata, engram_ids=None, rank=None):
         """``[tokens] -> [tokens, dim]`` hidden states after the final hc collapse and norm.
 
         ``engram_ids [tokens, n_engram_layers, cols]`` are the n-gram hash rows,
@@ -911,9 +922,10 @@ class DeepseekV41Model(nn.Module):
         """
         if not hasattr(self, "caches"):
             raise RuntimeError("bind_kv_cache() has not been called")
-        step = build_step(self.layout, self.caches.num_pages, positions, attn_metadata)
+        rank = self._rank(rank, input_ids.device)
+        step = build_step(self.layout, self.caches.num_pages, positions, attn_metadata, rank)
         n, T = step.n, step.T
-        h = self.embed_tokens(input_ids.view(n, T))
+        h = self.embed_tokens(input_ids.view(n, T), rank)
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
         pre_mix = torch.zeros(n, T, self.hc, dtype=torch.float32, device=h.device)
         pre_mix[..., 0] = 1.0
@@ -960,7 +972,7 @@ class DeepseekV41Model(nn.Module):
                 logit_mask=None, rank=None, engram_ids=None, **_unused):
         if spec_decode_metadata is not None:
             raise NotImplementedError("speculative decoding (MTP / DSpark) is out of scope")
-        hidden = self.hidden_states(input_ids, positions, attn_metadata, engram_ids)
+        hidden = self.hidden_states(input_ids, positions, attn_metadata, engram_ids, rank)
         if sampling_positions is not None:
             hidden = torch.index_select(hidden, 0, sampling_positions)
         if self.on_device_sampling_config is None:
