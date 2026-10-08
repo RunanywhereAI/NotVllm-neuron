@@ -710,28 +710,42 @@ class MoE(nn.Module):
 
 
 # ------------------------------------------------------------------------ engram
+def _byte_tables():
+    """Exact fp32 values of every e4m3fn and e8m0 byte, built on the CPU."""
+    b = torch.arange(256, dtype=torch.int32, device="cpu").to(torch.uint8)
+    return b.view(torch.float8_e4m3fn).float(), b.view(torch.float8_e8m0fnu).float()
+
+
 class EngramEmbedding(nn.Module):
-    """The n-gram table, FP8 with a per-32 e8m0 scale, dequantized to bf16 on lookup.
-    Rows split ``ceil(rows / tp)`` per rank; a row off this rank reads as zero and the
-    all-reduce sums in the one real copy, exactly."""
+    """The n-gram table, FP8 e4m3 rows with a per-32 e8m0 scale, dequantized to bf16 on
+    lookup. Rows split ``ceil(rows / tp)`` per rank; a row off this rank reads as zero and
+    the all-reduce sums in the one real copy, exactly.
+
+    Stored as raw bytes and decoded through 256-entry tables: neuronx-cc has no e8m0
+    type, and trn2's e4m3 is not the OCP e4m3fn the checkpoint uses, so no fp8 dtype may
+    appear in the graph.
+    """
 
     def __init__(self, rows: int, dim: int, par: Parallel = Parallel(), block: int = 32):
         super().__init__()
         self.block, self.par = block, par
         self.rows_local = -(-rows // par.tp)
         self.r0 = par.rank * self.rows_local          # load time only; forward reads the rank tensor
-        self.weight = nn.Parameter(torch.zeros(self.rows_local, dim, dtype=torch.float8_e4m3fn),
+        self.weight = nn.Parameter(torch.zeros(self.rows_local, dim, dtype=torch.uint8),
                                    requires_grad=False)
-        self.scale = nn.Parameter(torch.zeros(self.rows_local, dim // block,
-                                              dtype=torch.float8_e8m0fnu), requires_grad=False)
+        self.scale = nn.Parameter(torch.zeros(self.rows_local, dim // block, dtype=torch.uint8),
+                                  requires_grad=False)
+        e4m3, e8m0 = _byte_tables()
+        self.register_buffer("e4m3", e4m3, persistent=False)
+        self.register_buffer("e8m0", e8m0, persistent=False)
 
     def forward(self, ids, rank):
         local = ids - rank * self.rows_local
         off = (local < 0) | (local >= self.rows_local)
         local = torch.where(off, torch.zeros_like(local), local)
-        v = F.embedding(local, self.weight.view(torch.uint8)).view(torch.float8_e4m3fn)
-        s = F.embedding(local, self.scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
-        v = v.float().unflatten(-1, (-1, self.block)) * s.float().unsqueeze(-1)
+        v = self.e4m3[F.embedding(local, self.weight).long()]
+        s = self.e8m0[F.embedding(local, self.scale).long()]
+        v = v.unflatten(-1, (-1, self.block)) * s.unsqueeze(-1)
         v = v.flatten(-2).to(torch.bfloat16)
         v = torch.where(off.unsqueeze(-1), torch.zeros_like(v), v)
         return self.par.all_reduce(v)
@@ -1060,7 +1074,8 @@ class DeepseekV41Model(nn.Module):
                                 for x in experts])
         if rest in ("engram.embed.weight", "engram.embed.scale"):
             emb = layer.engram.embed
-            return src.get(name, rows=(emb.r0, emb.r0 + emb.rows_local), pad=True)
+            t = src.get(name, rows=(emb.r0, emb.r0 + emb.rows_local), pad=True)
+            return t.contiguous().view(torch.uint8)               # bit-exact bytes
         if rest == "engram.wkv.weight":
             out = layer.engram.wkv.weight.shape[0]
             return src.get(name, rows=(par.rank * out, (par.rank + 1) * out))
