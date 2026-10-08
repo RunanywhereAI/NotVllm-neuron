@@ -59,6 +59,34 @@ try:
 except ImportError:  # pragma: no cover
     write_cache_rows = LatentPageLayout = paged_block_ids = reserved_pages = None
 
+try:
+    from vllm_neuron.functional.topk import topk as _nf_topk
+except ImportError:  # pragma: no cover - hosts without nki (the oracle laptop)
+    _nf_topk = None
+
+
+def _topk_indices(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Indices of the ``k`` largest along the last dim, in no particular order.
+
+    ``torch.topk`` lowers to an HLO ``sort``, which trn2 rejects (NCC_EVRF029). The
+    plugin's rotational NKI top-k is what DeepSeek-V4.1 uses at the same shapes, and it
+    falls back to ``torch.topk`` off device. Callers here only build masks or gather by
+    index, so the order does not matter."""
+    if _nf_topk is None:
+        return x.topk(k, dim=-1).indices
+    return _nf_topk(x, k, dim=-1, gather_dim=-1)[1].to(torch.long)
+
+
+def _idiv(x, d: int):
+    """``x // d`` for a NON-NEGATIVE tensor: truncating division, because floor division
+    and ``remainder`` on int64 lower through float64 under torch_xla (NCC_ESPP004)."""
+    return torch.div(x, d, rounding_mode="trunc") if isinstance(x, torch.Tensor) else x // d
+
+
+def _imod(x, d: int):
+    """``x % d`` for a NON-NEGATIVE tensor; see ``_idiv``."""
+    return torch.fmod(x, d) if isinstance(x, torch.Tensor) else x % d
+
 
 @dataclass(frozen=True)
 class MLAParams:
@@ -145,9 +173,9 @@ def select_tokens(scores, lens, topk, kpool):
     ``topk + kpool - 1`` = 2051, not 2048; vLLM's own gate at 2048 is conservative.
     """
     B, S, P = scores.shape
-    n_complete = lens // kpool
+    n_complete = _idiv(lens, kpool)
     cand = torch.arange(P, device=scores.device)[None, :] < n_complete[:, None]
-    top = scores.masked_fill(~cand, float("-inf")).topk(min(topk // kpool, P), -1).indices
+    top = _topk_indices(scores.masked_fill(~cand, float("-inf")), min(topk // kpool, P))
     ok = cand.expand(B, S, P).gather(-1, top)
     off = torch.arange(kpool, device=scores.device)
     tok = (top[..., None] * kpool + off).masked_fill(~ok[..., None], -1).flatten(-2)
@@ -290,7 +318,10 @@ class Glm5NextIndexer(nn.Module):
 def indices_to_mask(idx, L):
     """``[B,S,W]`` token indices (``-1`` = empty) -> bool ``[B,S,L]``."""
     safe = torch.where(idx < 0, L, idx)
-    return torch.zeros(*idx.shape[:2], L + 1, dtype=torch.bool,
+    # at least as wide as the index: torch allows a wider index along the scatter dim,
+    # torch_xla's lowering does not (prefill selects 2051 > L + 1 slots at L = 512)
+    width = max(L + 1, idx.shape[-1])
+    return torch.zeros(*idx.shape[:2], width, dtype=torch.bool,
                        device=idx.device).scatter_(-1, safe, True)[..., :L]
 
 
@@ -525,7 +556,7 @@ class Glm5NextSparseMLA(nn.Module):
         _capture_tensor(f"{self.layer_name}.latent", lat)
 
         # -- the indexer: close a pool if this token completes one
-        slot = p % kp
+        slot = _imod(p, kp)
         sidx = torch.arange(kp, device=x.device)
         before = (sidx[None, :] < slot[:, None])[..., None]
         now = (sidx[None, :] == slot[:, None])[..., None]
@@ -534,9 +565,9 @@ class Glm5NextSparseMLA(nn.Module):
         new_pool = kpool_compress(win_k, win_g, self.indexer.index_kpool_compress_ape)  # [n, D]
         closes = slot == kp - 1
         jp = torch.arange(P, device=x.device)
-        pools = torch.where(((jp[None, :] == (p // kp)[:, None]) & closes[:, None])[..., None],
+        pools = torch.where(((jp[None, :] == _idiv(p, kp)[:, None]) & closes[:, None])[..., None],
                             new_pool[:, None].to(pools.dtype), pools)
-        pools = torch.where((jp[None, :] < (L // kp)[:, None])[..., None], pools,
+        pools = torch.where((jp[None, :] < _idiv(L, kp)[:, None])[..., None], pools,
                             torch.zeros_like(pools))
         scores = self.indexer.score(iq, iw, pools)                       # [n, 1, P]
         idx = self.indexer.select(scores.view(1, n, P), L).view(n, 1, -1)
