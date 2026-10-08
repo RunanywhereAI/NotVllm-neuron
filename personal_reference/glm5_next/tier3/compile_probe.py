@@ -60,6 +60,13 @@ ARGS = [a for a in sys.argv[2:] if not a.startswith("--")]
 WHICH = ARGS or ["prefill", "decode"]
 COMPILE = "--compile" in sys.argv
 TP, EP, ETP = 64, 32, 2
+RANK = int(os.environ.get("GLM_RANK", "0"))
+# the runner's compile options (neuron_model_runner.py, "Build compile options"), so the
+# capture directory name is the cache key the server computes
+RUNNER_OPTIONS = {"alias_meta_to_neuron": True, "compiler_args": [
+    "--auto-cast=none", "--verbose=35", "-O1",
+    "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10",
+    "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"]}
 # the serve script's shapes (serve_glm53f.sh): single-shot prefill bucket == max_model_len
 MAX_LEN = int(os.environ.get("GLM_MAX_LEN", "2048"))
 T_PREFILL = int(os.environ.get("GLM_T_PREFILL", str(MAX_LEN)))
@@ -76,9 +83,11 @@ FLAGS = ["--framework", "XLA", "--target", "trn2", "--lnc", "2", "--auto-cast=no
 def init_groups():
     from torch.testing._internal.distributed.fake_pg import FakeStore
     if not dist.is_initialized():
-        dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=TP)
+        dist.init_process_group("fake", store=FakeStore(), rank=RANK, world_size=TP)
     world = dist.group.WORLD
-    etp = dist.new_group(ranks=list(range(ETP)))
+    # every rank creates every EP-TP row group, in order, as the plugin's parallel state does
+    rows = [dist.new_group(ranks=list(range(r * ETP, (r + 1) * ETP))) for r in range(TP // ETP)]
+    etp = rows[RANK // ETP]
     # the capture backend names per-rank workdirs from vLLM's TP group; one is enough
     from libtorch_neuronx_lite.compile import capture_backend as cb
     orig = cb.setup_workdir_common
@@ -89,8 +98,8 @@ def init_groups():
 class Coordinator:
     """The slice of vLLM's GroupCoordinator the GLM model uses, over a fake group."""
 
-    def __init__(self, pg, world_size):
-        self.device_group, self.world_size, self.rank_in_group = pg, world_size, 0
+    def __init__(self, pg, world_size, rank_in_group=0):
+        self.device_group, self.world_size, self.rank_in_group = pg, world_size, rank_in_group
 
     def all_reduce(self, t):
         return funcol.all_reduce(t, "sum", self.device_group)
@@ -134,10 +143,10 @@ def build_model():
     hf = truncated_hf_config()
     config = Glm5NextConfig.from_configs(hf, text_neuron_config=None)
     config.text_config.torch_dtype = torch.bfloat16
-    layout = M.ExpertLayout(ep_degree=EP, ep_rank=0, tp_degree=ETP, tp_rank=0,
-                            ep_tp_group=Coordinator(etp, ETP))
+    layout = M.ExpertLayout(ep_degree=EP, ep_rank=RANK // ETP, tp_degree=ETP, tp_rank=RANK % ETP,
+                            ep_tp_group=Coordinator(etp, ETP, RANK % ETP))
     with torch.device("meta"):
-        model = M.Glm5NextForCausalLM(config, tp_group=Coordinator(world, TP), expert_layout=layout)
+        model = M.Glm5NextForCausalLM(config, tp_group=Coordinator(world, TP, RANK), expert_layout=layout)
     model.set_dtype(torch.bfloat16)
     model.to(META)
     return model
@@ -287,19 +296,21 @@ def capture(model, name, kwargs):
             print(f"  FX-LINT {why}: {op} x{k} at {where}", flush=True)
         if not uniq:
             print("  FX-LINT clean", flush=True)
-        return cap(gm, example_inputs, {"alias_meta_to_neuron": True, "compiler_workdir": str(workdir)})
+        return cap(gm, example_inputs, {**RUNNER_OPTIONS, "compiler_workdir": str(workdir)})
 
     before = set(glob.glob(f"{workdir}/**/graph.hlo", recursive=True))
     compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
     t0 = time.time()
     try:
-        with torch.no_grad():
-            compiled(**kwargs)
+        compiled(**kwargs)        # grad enabled outside, as the runner calls it
     except CaptureComplete:
         pass
     hlos = sorted(set(glob.glob(f"{workdir}/**/graph.hlo", recursive=True)) - before)
     print(f"{name}: captured {len(hlos)} graph(s) in {time.time() - t0:.0f}s", flush=True)
+    import hashlib
     for h in hlos:
+        print(f"  KEY {name} rank {RANK}: {Path(h).parent.name}  hlo_md5 "
+              f"{hashlib.md5(open(h, 'rb').read()).hexdigest()}", flush=True)
         print(f"  HLO {h}: {json.dumps(hlo_lint(h))}", flush=True)
     torch._dynamo.reset()
     return hlos
