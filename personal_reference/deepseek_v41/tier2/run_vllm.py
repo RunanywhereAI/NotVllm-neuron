@@ -51,10 +51,11 @@ def main(tiny_dir: str, tp: int = 1, new_tokens: int = 12) -> int:
         model=str(tiny / "served"),
         skip_tokenizer_init=True,
         dtype="float32",
-        max_model_len=1024,
+        max_model_len=2048,
         max_num_seqs=2,
         tensor_parallel_size=tp,
         enable_prefix_caching=True,
+        max_num_batched_tokens=1024,     # APC needs segmented prefill: a supported size below max_model_len
         async_scheduling=False,
         enforce_eager=True,
         num_gpu_blocks_override=256,
