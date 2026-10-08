@@ -60,7 +60,12 @@ ARGS = [a for a in sys.argv[2:] if not a.startswith("--")]
 WHICH = ARGS or ["prefill", "decode"]
 COMPILE = "--compile" in sys.argv
 TP, EP, ETP = 64, 32, 2
-NUM_BLOCKS, MAX_LEN, T_PREFILL, N_DECODE = 160, 8192, 512, 16
+# the serve script's shapes (serve_glm53f.sh): single-shot prefill bucket == max_model_len
+MAX_LEN = int(os.environ.get("GLM_MAX_LEN", "2048"))
+T_PREFILL = int(os.environ.get("GLM_T_PREFILL", str(MAX_LEN)))
+N_DECODE = int(os.environ.get("GLM_SEQS", "16"))
+NUM_BLOCKS = int(os.environ.get("GLM_BLOCKS", str((MAX_LEN // 64 + 4) * N_DECODE + 64)))
+FULL_DEPTH = os.environ.get("GLM_LAYERS", "4") == "all"
 META = torch.device("meta")
 FLAGS = ["--framework", "XLA", "--target", "trn2", "--lnc", "2", "--auto-cast=none", "--verbose=35", "-O1",
          "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 --experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
@@ -98,6 +103,8 @@ class Coordinator:
 def truncated_hf_config(n_layers=4):
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(str(GLM_DIR))
+    if FULL_DEPTH:
+        return cfg
     t = cfg.text_config
     full = t.num_hidden_layers
     layer_types = list(t.layer_types)
@@ -301,16 +308,25 @@ def capture(model, name, kwargs):
 def neuronx_cc(name, hlo):
     d = os.path.dirname(hlo)
     t0 = time.time()
-    r = subprocess.run(["/data/venv-fork/bin/neuronx-cc", "compile", hlo, *FLAGS, "--output", f"{d}/graph.neff",
+    r = subprocess.run(["nice", "-n", "10", "/data/venv-fork/bin/neuronx-cc", "compile", hlo, *FLAGS, "--output", f"{d}/graph.neff",
                         "--logfile", f"{d}/log-neuron-cc.txt"], cwd=d, capture_output=True, text=True)
     lines = (r.stdout + r.stderr).splitlines()
     err = [l for l in lines if "[INTERNAL_ERROR]" in l or "ERROR" in l or "NCC_" in l]
-    print(f"{name}: neuronx-cc rc={r.returncode} in {time.time() - t0:.0f}s"
+    hbm = ""
+    try:
+        log = open(f"{d}/log-neuron-cc.txt", errors="replace").read()
+        hits = [l for l in log.splitlines() if "HBM usage is" in l or "peak HBM" in l or "NCC_EOOM" in l]
+        hbm = hits[-1].split("]: ", 1)[-1][:300] if hits else ""
+    except OSError:
+        pass
+    print(f"{name}: neuronx-cc rc={r.returncode} in {time.time() - t0:.0f}s; {hbm}"
           + ("" if r.returncode == 0 else f"\n  first error: {err[0][:600] if err else lines[-5:]}"), flush=True)
 
 
 def main():
     model = build_model()
+    print(f"layers {len(model.model.layers)}, prefill T={T_PREFILL}, max_len {MAX_LEN}, decode n={N_DECODE}, "
+          f"blocks {NUM_BLOCKS}", flush=True)
     runner = MetaRunner(model, aligned_block_size(model))
     jobs = []
     if "prefill" in WHICH:
