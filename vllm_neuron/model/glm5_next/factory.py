@@ -64,8 +64,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     @classmethod
     def _text_config(cls, vllm_config) -> "object":
+        """The text config at the dtype vLLM SERVES in, not the checkpoint's: every
+        page size and state dtype vLLM computes here must match what the model, built
+        at the serving dtype, lays out (``model.from_configs`` does the same)."""
         hf_config = vllm_config.model_config.hf_config
-        return Glm5NextConfig.from_hf(hf_config).text_config
+        text = Glm5NextConfig.from_hf(hf_config).text_config
+        text.torch_dtype = vllm_config.model_config.dtype
+        return text
 
     @classmethod
     def get_mamba_state_shape_from_config(
