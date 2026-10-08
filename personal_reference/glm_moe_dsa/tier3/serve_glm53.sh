@@ -14,7 +14,7 @@
 # Compile probe (personal_reference/glm_moe_dsa/tier3/compile_probe.py, full depth,
 # T=512 prefill, n=16 decode, max_len 8192), compiler's total estimated HBM per core:
 #   512 blocks:  prefill 13.57 GB, decode 14.50 GB (scratch 0.3 / 1.3 GB)
-#   1024 blocks: see /data/logs/glm53_probe_pl8k1024.log
+#   1024 blocks: prefill 15.37 GB, decode 16.26 GB (scratch 0.35 / 1.28 GB)
 # Decode scratch grows with SEQS x MAX_LEN (every request reads the whole addressable
 # context); 16 x 8192 is what was compiled.
 #
