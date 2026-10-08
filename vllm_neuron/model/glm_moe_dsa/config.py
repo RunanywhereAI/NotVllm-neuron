@@ -14,6 +14,10 @@ stored list when one is present):
   ``index_topk_freq`` / ``index_skip_topk_offset``.
 * ``mlp_layer_types``: the first ``first_k_dense_replace`` layers are dense.
 
+Served dir: ``make_served_dir`` writes ``config.json`` without ``quantization_config`` (vLLM
+refuses an fp8 config here before plugin code runs), recorded as
+``original_quantization_config``, and symlinks every other file.
+
 ``head_dim`` in ``config.json`` (192) is NOT the rotary width: transformers overwrites
 it with ``qk_rope_head_dim`` (64). The model reads ``qk_rope_head_dim`` only.
 """
@@ -45,6 +49,24 @@ def derive_indexer_types(n_layers: int, pattern=None, freq: int = 1, offset: int
         return tuple(pattern)
     freq = max(freq, 1)
     return tuple("full" if (max(i - offset + 1, 0) % freq) == 0 else "shared" for i in range(n_layers))
+
+
+def make_served_dir(hf_dir, out_dir):
+    import json
+    from pathlib import Path
+
+    hf_dir, out_dir = Path(hf_dir).resolve(), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = json.loads((hf_dir / "config.json").read_text())
+    q = cfg.pop("quantization_config", None)
+    if q is not None:
+        cfg["original_quantization_config"] = q
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    for src in hf_dir.iterdir():
+        dst = out_dir / src.name
+        if src.name != "config.json" and not dst.exists():
+            dst.symlink_to(src)
+    return out_dir
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,7 +145,9 @@ class GlmMoeDsaArgs:
         mt = tuple(mt)
         if it[0] != "full":
             raise ValueError("layer 0 must own an indexer (a shared layer reuses a previous one)")
-        q = _get(cfg, "quantization_config", None)
+        # a served dir strips quantization_config (vLLM refuses fp8 configs on this
+        # platform before any plugin code runs) and keeps it as original_quantization_config
+        q = _get(cfg, "quantization_config", None) or _get(cfg, "original_quantization_config", None)
         block = None
         if q:
             qd = q if isinstance(q, dict) else q.to_dict()
