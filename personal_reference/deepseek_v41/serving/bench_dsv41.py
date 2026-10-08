@@ -254,7 +254,7 @@ def markdown(res: dict) -> str:
                     f"{fmt(lv['agg_input_tok_s'], 0)} | {fmt(lv['prompt_tokens_mean'], 0)} | "
                     f"{fmt(lv['prefix_cache_hit_rate'], 3)} |")
     s = res["sanity"]
-    head = (f"# DeepSeek-V4.1-Flash on trn2.48xlarge — {res['timestamp']}\n\n"
+    head = (f"# {res['model']} on trn2.48xlarge — {res['timestamp']}\n\n"
             f"Workload: {res['workload']}\n\n"
             f"Sanity (greedy, 16 tokens): `The capital of France is` -> `{s.get('text', '')!r}`\n\n"
             f"Warmup: TTFT {fmt(res['warmup'].get('ttft'))} s, e2e {fmt(res['warmup'].get('e2e'))} s, "
@@ -272,6 +272,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--tokenizer", default="/data/dsv41-served")
     ap.add_argument("--out-dir", default="/data/logs")
+    ap.add_argument("--preamble-tokens", type=int, default=PREAMBLE_TOKENS)
+    ap.add_argument("--suffix-tokens", type=int, default=SUFFIX_TOKENS)
+    ap.add_argument("--tag", default="dsv41", help="file prefix: /data/logs/<tag>-bench-<ts>.*")
     a = ap.parse_args()
     levels = [int(x) for x in a.levels.split(",") if x]
     per_level = {c: (a.per_level or max(4, 2 * c)) for c in levels}
@@ -291,7 +294,7 @@ def main() -> int:
         count, how = server.count_tokens, "server /tokenize"
 
     t0 = time.time()
-    preamble, prompts, stats = build_prompts(count, n_total)
+    preamble, prompts, stats = build_prompts(count, n_total, a.preamble_tokens, a.suffix_tokens)
     lens = [count(p) for p in prompts]
     pre_ids_ok = None
     if a.dry_run and how.startswith("transformers"):
@@ -335,10 +338,10 @@ def main() -> int:
               f"{fmt(lv['prefix_cache_hit_rate'], 3)} | ok {lv['ok']}/{lv['requests']}"
               + (f" | errors {lv['errors'][:2]}" if lv["errors"] else ""), flush=True)
         # write as we go: the instance may not last
-        (out_dir / f"dsv41-bench-{ts}.json").write_text(json.dumps(res, indent=1))
-        (out_dir / f"dsv41-bench-{ts}.md").write_text(markdown(res))
+        (out_dir / f"{a.tag}-bench-{ts}.json").write_text(json.dumps(res, indent=1))
+        (out_dir / f"{a.tag}-bench-{ts}.md").write_text(markdown(res))
     print(markdown(res), flush=True)
-    print(f"wrote {out_dir}/dsv41-bench-{ts}.{{json,md}}", flush=True)
+    print(f"wrote {out_dir}/{a.tag}-bench-{ts}.{{json,md}}", flush=True)
     return 0
 
 
