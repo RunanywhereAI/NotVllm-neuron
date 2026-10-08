@@ -774,6 +774,9 @@ class GlmMoeDsaModel(nn.Module):
 
     def load_weights(self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None):
         with Checkpoint(checkpoint_path) as ckpt:
+            if self.args.fp8_block is None and any(k.endswith("weight_scale_inv") for k in ckpt.weight_map):
+                raise ValueError("the checkpoint is block FP8 but the config carries no "
+                                 "(original_)quantization_config: serve from make_served_dir")
             self.load_from(CheckpointSource(ckpt, self.args.fp8_block), device)
 
 
