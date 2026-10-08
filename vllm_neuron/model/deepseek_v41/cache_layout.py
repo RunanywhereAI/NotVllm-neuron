@@ -164,10 +164,13 @@ class CacheLayout:
         return (page * self.n_fields + field) * self.window_block + tok
 
     def latent_row(self, source: int, page: torch.Tensor, entry: torch.Tensor) -> torch.Tensor:
-        return (page * self.comp_page_elems + self.latent_off[source]) // self.head_dim + entry
+        # truncating division: floor division on int64 lowers through float64 on Neuron
+        return torch.div(page * self.comp_page_elems + self.latent_off[source], self.head_dim,
+                         rounding_mode="trunc") + entry
 
     def index_row(self, source: int, page: torch.Tensor, entry: torch.Tensor) -> torch.Tensor:
-        return (page * self.comp_page_elems + self.index_off[source]) // self.index_head_dim + entry
+        return torch.div(page * self.comp_page_elems + self.index_off[source], self.index_head_dim,
+                         rounding_mode="trunc") + entry
 
 
 def source_of(layer: int, sources) -> int | None:
