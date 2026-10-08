@@ -911,6 +911,10 @@ class DeepseekV41Model(nn.Module):
     def __init__(self, args, block_size: int = 32, cache_dtype: torch.dtype = torch.bfloat16,
                  par: Parallel = Parallel()):
         super().__init__()
+        import os
+
+        # [unverified fix] one KV buffer per group, see NeuronModelRunner.initialize_kv_cache
+        self.kv_cache_unshared = os.environ.get("DSV41_UNSHARED_KV", "0") == "1"
         self.args, self.par = args, par
         n = args.n_layers
         ratios = args.compress_ratios[:n]
