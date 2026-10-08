@@ -454,8 +454,8 @@ def test_emitted_tensors_equal_convert_py_output(ckpt):
                 theirs[scale] = f.get_tensor(scale)
             want = _emit(name, theirs)
             got = ckpt.load(name)
-            if name == "head.weight":                      # fp32 here, bf16 in the file
-                want = want.float()
+            if ckpt._by_target[name].action == W.TO_FP32:  # convert.py keeps the bf16;
+                want = want.float()                        # the reference upcasts at load
             assert _same(got, want), name
         rows = f.get_slice("layers.14.engram.embed.weight")[1000:1064]
         assert _same(ckpt.raw_slice("layers.14.engram.embed.weight")[1000:1064], rows)
