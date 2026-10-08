@@ -175,7 +175,14 @@ def select_tokens(scores, lens, topk, kpool):
     B, S, P = scores.shape
     n_complete = _idiv(lens, kpool)
     cand = torch.arange(P, device=scores.device)[None, :] < n_complete[:, None]
-    top = _topk_indices(scores.masked_fill(~cand, float("-inf")), min(topk // kpool, P))
+    k = min(topk // kpool, P)
+    if k >= P:
+        # every pool is picked, so the picks are exactly the complete ones. No top-k at
+        # k == width: outside the NKI kernel's envelope, and DeepSeek-V4.1's fallback
+        # faulted out of bounds on device there (43e29ae). Order is irrelevant downstream.
+        top = torch.arange(P, device=scores.device).expand(B, S, P)
+    else:
+        top = _topk_indices(scores.masked_fill(~cand, float("-inf")), k)
     ok = cand.expand(B, S, P).gather(-1, top)
     off = torch.arange(kpool, device=scores.device)
     tok = (top[..., None] * kpool + off).masked_fill(~ok[..., None], -1).flatten(-2)
