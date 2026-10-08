@@ -195,8 +195,11 @@ class Parallel:
 
 @functools.lru_cache(maxsize=4)
 def rope_inv_freq(dim: int, theta: float) -> torch.Tensor:
-    """transformers' default RoPE ``inv_freq`` (fp32, CPU)."""
-    return 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.int64).to(torch.float32) / dim))
+    """transformers' default RoPE ``inv_freq`` (fp32). Always on the CPU, explicitly: it is
+    first called while the runner builds the model under ``torch.device("meta")``, and
+    the cache would otherwise keep a meta tensor."""
+    cpu = torch.device("cpu")
+    return 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.int64, device=cpu).to(torch.float32) / dim))
 
 
 def rope_interleave(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
