@@ -70,7 +70,7 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 
 from .cache_layout import latent_page_bytes
 from .kda import Glm5NextKDA
-from .mla import Glm5NextSparseMLA
+from .mla import Glm5NextSparseMLA, _topk_indices
 
 try:
     from vllm_neuron.accuracy.tensor_capture import capture_tensor as _capture_tensor
@@ -208,8 +208,9 @@ class Glm5NextRouter(nn.Module):
         weight them. None of them can express that.
         """
         scores = F.linear(x.float(), self.weight.float()).sigmoid()
-        idx = torch.topk(scores + self.e_score_correction_bias.float(), self.top_k, -1,
-                         sorted=False).indices
+        # top-k through the rotational NKI kernel on device: torch.topk lowers to an HLO
+        # sort, which trn2 rejects (NCC_EVRF029)
+        idx = _topk_indices(scores + self.e_score_correction_bias.float(), self.top_k)
         w = scores.gather(1, idx)
         if self.norm:
             w = w / (w.sum(-1, keepdim=True) + 1e-20)
