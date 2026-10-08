@@ -106,3 +106,27 @@ def test_engram_contribution_is_visible():
     # non-vacuity: wrong hash rows must show, or the comparison above proves nothing
     errs = _scenario(blank_engram=True)
     assert min(errs.values()) > 1e-2, errs
+
+
+def test_runner_style_host_ids_match_the_hasher():
+    """What the runner hands the model: the token table, a batch row per scheduled token
+    (-1 for a padded decode row) and positions. Must equal hashing each true sequence."""
+    _, args, _ = _build()
+    M = ph.import_plugin("vllm_neuron.model.deepseek_v41.model")
+    with torch.device("meta"):
+        model = M.DeepseekV41Model(args, block_size=8)
+    hasher = E.EngramHasher(args, TOKEN_MAP, CV)
+    model.set_engram_hasher(hasher)
+    torch.manual_seed(5)
+    table = torch.randint(0, args.vocab_size, (3, 64))
+    # decode: rows 0..2 at different positions, two padded rows
+    pos = torch.tensor([0, 17, 40, 0, 0])
+    rows = torch.tensor([0, 1, 2, -1, -1])
+    got = model.engram_host_ids(table, rows, pos)
+    for i in range(3):
+        assert torch.equal(got[i], hasher(table[i].tolist(), int(pos[i]), 1)[0].int())
+    assert got.dtype == torch.int32 and got.shape == (5, 2, 6)
+    # prefill of row 1 from a cached prefix at 32, padded by repeating the last position
+    pos = torch.tensor(list(range(32, 45)) + [44] * 3)
+    got = model.engram_host_ids(table, torch.ones(16, dtype=torch.long), pos)
+    assert torch.equal(got[:13], hasher(table[1].tolist(), 32, 13).int())
