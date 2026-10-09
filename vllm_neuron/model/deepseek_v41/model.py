@@ -91,7 +91,14 @@ def topk_indices(x: torch.Tensor, k: int) -> torch.Tensor:
     """
     if _nf_topk is None:
         return x.topk(k, dim=-1).indices
-    return _nf_topk(x, k, dim=-1, gather_dim=-1)[1].to(torch.long)
+    # torch.topk over NaN still returns in-range indices; the device kernel's are not
+    # guaranteed to be, and they feed gathers (experts, compressed blocks, index keys)
+    # where an out-of-range id is a DGE out-of-bound fault. Rows that can hold NaN or
+    # all -inf: padded and dead rows, unwritten pages. Their picks are selected away later.
+    lo = torch.full_like(x, torch.finfo(x.dtype).min)
+    x = torch.where(torch.isnan(x) | torch.isneginf(x), lo, x)
+    idx = _nf_topk(x, k, dim=-1, gather_dim=-1)[1].to(torch.long)
+    return idx.clamp(0, x.shape[-1] - 1)
 
 
 # ------------------------------------------------------------------------- basic ops
